@@ -20,8 +20,14 @@
 @end
 */
 
-#include "platform.h"
-#include "../include/czmq.h"
+#include "czmq_classes.h"
+
+// For getcwd() variants
+#if (defined (WIN32))
+# include <direct.h>
+#else
+# include <unistd.h>
+#endif
 
 //  --------------------------------------------------------------------------
 //  Signal handling
@@ -29,7 +35,6 @@
 //  These are global variables accessible to CZMQ application code
 volatile int zsys_interrupted = 0;  //  Current name
 volatile int zctx_interrupted = 0;  //  Deprecated name
-volatile uint64_t zsys_allocs = 0;
 
 static void s_signal_handler (int signal_value);
 
@@ -50,8 +55,11 @@ s_handler_fn_shim (DWORD ctrltype)
         installed_handler_fn (ctrltype);
         return TRUE;
     }
-    else
-        return FALSE;
+    if (ctrltype == CTRL_CLOSE_EVENT && installed_handler_fn != NULL) {
+        installed_handler_fn (ctrltype);
+        return TRUE;
+    }
+    return FALSE;
 }
 #endif
 
@@ -62,16 +70,31 @@ s_handler_fn_shim (DWORD ctrltype)
 static void *s_process_ctx = NULL;
 static bool s_initialized = false;
 
+#ifndef S_DEFAULT_ZSYS_FILE_STABLE_AGE_MSEC
+// This is a private tunable that is likely to be replaced or tweaked later
+// per comment block at s_zsys_file_stable() implementation, to reflect
+// the best stat data granularity available on host OS *and* used by czmq.
+#define S_DEFAULT_ZSYS_FILE_STABLE_AGE_MSEC 5000
+#endif
+
 //  Default globals for new sockets and other joys; these can all be set
 //  from the environment, or via the zsys_set_xxx API.
 static size_t s_io_threads = 1;     //  ZSYS_IO_THREADS=1
+static int s_thread_sched_policy = -1; //  ZSYS_THREAD_SCHED_POLICY=-1
+static int s_thread_priority = -1;  //  ZSYS_THREAD_PRIORITY=-1
 static size_t s_max_sockets = 1024; //  ZSYS_MAX_SOCKETS=1024
+static int s_max_msgsz = INT_MAX;   //  ZSYS_MAX_MSGSZ=INT_MAX
+static int64_t s_file_stable_age_msec = S_DEFAULT_ZSYS_FILE_STABLE_AGE_MSEC;
+                                    //  ZSYS_FILE_STABLE_AGE_MSEC=5000
 static size_t s_linger = 0;         //  ZSYS_LINGER=0
 static size_t s_sndhwm = 1000;      //  ZSYS_SNDHWM=1000
 static size_t s_rcvhwm = 1000;      //  ZSYS_RCVHWM=1000
 static size_t s_pipehwm = 1000;     //  ZSYS_PIPEHWM=1000
 static int s_ipv6 = 0;              //  ZSYS_IPV6=0
 static char *s_interface = NULL;    //  ZSYS_INTERFACE=
+static char *s_ipv6_address = NULL; //  ZSYS_IPV6_ADDRESS=
+static char *s_ipv6_mcast_address = NULL; //  ZSYS_IPV6_MCAST_ADDRESS=
+static int s_auto_use_fd = 0;       //  ZSYS_AUTO_USE_FD=0
 static char *s_logident = NULL;     //  ZSYS_LOGIDENT=
 static FILE *s_logstream = NULL;    //  ZSYS_LOGSTREAM=stdout/stderr
 static bool s_logsystem = false;    //  ZSYS_LOGSYSTEM=true/false
@@ -83,7 +106,7 @@ static size_t s_open_sockets = 0;
 //  We keep a list of open sockets to report leaks to developers
 static zlist_t *s_sockref_list = NULL;
 
-//  This defines a single zsocket_new() caller instance
+//  This defines a single zsock_new() caller instance
 typedef struct {
     void *handle;
     int type;
@@ -131,6 +154,12 @@ zsys_init (void)
     if (getenv ("ZSYS_MAX_SOCKETS"))
         s_max_sockets = atoi (getenv ("ZSYS_MAX_SOCKETS"));
 
+    if (getenv ("ZSYS_MAX_MSGSZ"))
+        s_max_msgsz = atoi (getenv ("ZSYS_MAX_MSGSZ"));
+
+    if (getenv ("ZSYS_FILE_STABLE_AGE_MSEC"))
+        s_file_stable_age_msec = atoi (getenv ("ZSYS_FILE_STABLE_AGE_MSEC"));
+
     if (getenv ("ZSYS_LINGER"))
         s_linger = atoi (getenv ("ZSYS_LINGER"));
 
@@ -163,6 +192,10 @@ zsys_init (void)
         if (streq (getenv ("ZSYS_LOGSYSTEM"), "false"))
             s_logsystem = false;
     }
+
+    if (getenv ("ZSYS_AUTO_USE_FD"))
+        s_auto_use_fd = atoi (getenv ("ZSYS_AUTO_USE_FD"));
+
     zsys_catch_interrupts ();
 
     ZMUTEX_INIT (s_mutex);
@@ -187,11 +220,34 @@ zsys_init (void)
     if (getenv ("ZSYS_INTERFACE"))
         zsys_set_interface (getenv ("ZSYS_INTERFACE"));
 
+    if (getenv ("ZSYS_IPV6_ADDRESS"))
+        zsys_set_ipv6_address (getenv ("ZSYS_IPV6_ADDRESS"));
+
+    if (getenv ("ZSYS_IPV6_MCAST_ADDRESS"))
+        zsys_set_ipv6_mcast_address (getenv ("ZSYS_IPV6_MCAST_ADDRESS"));
+    else
+        zsys_set_ipv6_mcast_address ("ff02:0:0:0:0:0:0:1");
+
+
     if (getenv ("ZSYS_LOGIDENT"))
         zsys_set_logident (getenv ("ZSYS_LOGIDENT"));
 
     if (getenv ("ZSYS_LOGSENDER"))
         zsys_set_logsender (getenv ("ZSYS_LOGSENDER"));
+
+    zsys_set_max_msgsz (s_max_msgsz);
+
+    zsys_set_file_stable_age_msec (s_file_stable_age_msec);
+
+    if (getenv ("ZSYS_THREAD_PRIORITY"))
+        zsys_set_thread_priority (atoi (getenv ("ZSYS_THREAD_PRIORITY")));
+    else
+        zsys_set_thread_priority (s_thread_priority);
+
+    if (getenv ("ZSYS_THREAD_SCHED_POLICY"))
+        zsys_set_thread_sched_policy (atoi (getenv ("ZSYS_THREAD_SCHED_POLICY")));
+    else
+        zsys_set_thread_sched_policy (s_thread_sched_policy);
 
     return s_process_ctx;
 }
@@ -218,9 +274,8 @@ zsys_shutdown (void)
         zclock_sleep (200);
 
     //  Close logsender socket if opened (don't do this in critical section)
-    if (s_logsender) {
+    if (s_logsender)
         zsock_destroy (&s_logsender);
-    }
 
     //  No matter, we are now going to shut down
     //  Print the source reference for any sockets the app did not
@@ -229,26 +284,52 @@ zsys_shutdown (void)
     s_sockref_t *sockref = (s_sockref_t *) zlist_pop (s_sockref_list);
     while (sockref) {
         assert (sockref->filename);
-        zsys_error ("dangling '%s' socket created at %s:%d",
+        zsys_error ("[%d]dangling '%s' socket created at %s:%d",
+                    getpid (),
                     zsys_sockname (sockref->type),
                     sockref->filename, (int) sockref->line_nbr);
         zmq_close (sockref->handle);
-        free (sockref);
+        freen (sockref);
         sockref = (s_sockref_t *) zlist_pop (s_sockref_list);
+        --s_open_sockets;
     }
     zlist_destroy (&s_sockref_list);
     ZMUTEX_UNLOCK (s_mutex);
 
     if (s_open_sockets == 0)
-        zmq_term (s_process_ctx);
+    {
+      zmq_term(s_process_ctx);
+      s_process_ctx = NULL;
+      s_io_threads = 1;
+      s_thread_sched_policy = -1;
+      s_thread_priority = -1;
+      s_max_sockets = 1024;
+      s_max_msgsz = INT_MAX;
+      s_file_stable_age_msec = S_DEFAULT_ZSYS_FILE_STABLE_AGE_MSEC;
+      s_linger = 0;
+      s_sndhwm = 1000;
+      s_rcvhwm = 1000;
+      s_pipehwm = 1000;
+      s_ipv6 = 0;
+      s_auto_use_fd = 0;
+      s_logstream = NULL;
+      s_logsystem = false;
+    }
     else
         zsys_error ("dangling sockets: cannot terminate ZMQ safely");
 
     ZMUTEX_DESTROY (s_mutex);
 
     //  Free dynamically allocated properties
-    free (s_interface);
-    free (s_logident);
+    freen (s_interface);
+    freen (s_ipv6_address);
+    freen (s_ipv6_mcast_address);
+    freen (s_logident);
+
+    zsys_interrupted = 0;
+    zctx_interrupted = 0;
+
+    zsys_handler_reset ();
 
 #if defined (__UNIX__)
     closelog ();                //  Just to be pedantic
@@ -279,8 +360,14 @@ zsys_socket (int type, const char *filename, size_t line_nbr)
         //  Configure socket with process defaults
         zsock_set_linger (handle, (int) s_linger);
 #if (ZMQ_VERSION_MAJOR == 2)
-        //  For ZeroMQ/2.x we use sndhwm for both send and receive
-        zsock_set_hwm (handle, s_sndhwm);
+        // TODO: v2/v3 socket api in zsock_option.inc are not public (not
+        // added to include/zsock.h) so we have to use zmq_setsockopt directly
+        // This should be fixed and zsock_set_hwm should be used instead
+#       if defined (ZMQ_HWM)
+        uint64_t value = s_sndhwm;
+        int rc = zmq_setsockopt (handle, ZMQ_HWM, &value, sizeof (uint64_t));
+        assert (rc == 0 || zmq_errno () == ETERM);
+#       endif
 #else
         //  For later versions we use separate SNDHWM and RCVHWM
         zsock_set_sndhwm (handle, (int) s_sndhwm);
@@ -329,7 +416,7 @@ zsys_close (void *handle, const char *filename, size_t line_nbr)
         while (sockref) {
             if (sockref->handle == handle) {
                 zlist_remove (s_sockref_list, sockref);
-                free (sockref);
+                freen (sockref);
                 break;
             }
             sockref = (s_sockref_t *) zlist_next (s_sockref_list);
@@ -351,11 +438,20 @@ zsys_sockname (int socktype)
     char *type_names [] = {
         "PAIR", "PUB", "SUB", "REQ", "REP",
         "DEALER", "ROUTER", "PULL", "PUSH",
-        "XPUB", "XSUB", "STREAM"
+        "XPUB", "XSUB", "STREAM",
+        "SERVER", "CLIENT",
+        "RADIO", "DISH",
+        "SCATTER", "GATHER"
     };
     //  This array matches ZMQ_XXX type definitions
     assert (ZMQ_PAIR == 0);
-#if defined (ZMQ_STREAM)
+#if defined (ZMQ_SCATTER)
+    assert (socktype >= 0 && socktype <= ZMQ_SCATTER);
+#elif defined (ZMQ_DISH)
+    assert (socktype >= 0 && socktype <= ZMQ_DISH);
+#elif defined (ZMQ_CLIENT)
+    assert (socktype >= 0 && socktype <= ZMQ_CLIENT);
+#elif defined (ZMQ_STREAM)
     assert (socktype >= 0 && socktype <= ZMQ_STREAM);
 #else
     assert (socktype >= 0 && socktype <= ZMQ_XSUB);
@@ -374,14 +470,23 @@ zsys_create_pipe (zsock_t **backend_p)
 {
     zsock_t *frontend = zsock_new (ZMQ_PAIR);
     zsock_t *backend = zsock_new (ZMQ_PAIR);
-    if (!frontend || !backend) {
-        zsock_destroy (&frontend);
-        zsock_destroy (&backend);
-        return frontend;
-    }
+    assert (frontend);
+    assert (backend);
+
 #if (ZMQ_VERSION_MAJOR == 2)
-    zsock_set_hwm (frontend, zsys_pipehwm ());
-    zsock_set_hwm (backend, zsys_pipehwm ());
+    // TODO: v2/v3 socket api in zsock_option.inc are not public (not
+    // added to include/zsock.h) so we have to use zmq_setsockopt directly
+    // This should be fixed and zsock_set_hwm should be used instead
+#   if defined (ZMQ_HWM)
+    uint64_t value = zsys_pipehwm ();
+    int ret = zmq_setsockopt (zsock_resolve (frontend), ZMQ_HWM, &value,
+        sizeof (uint64_t));
+    assert (ret == 0 || zmq_errno () == ETERM);
+    value = zsys_pipehwm ();
+    ret = zmq_setsockopt (zsock_resolve (backend), ZMQ_HWM, &value,
+        sizeof (uint64_t));
+    assert (ret == 0 || zmq_errno () == ETERM);
+#   endif
 #else
     zsock_set_sndhwm (frontend, (int) zsys_pipehwm ());
     zsock_set_sndhwm (backend, (int) zsys_pipehwm ());
@@ -481,7 +586,8 @@ zsys_catch_interrupts (void)
 {
     //  Catch SIGINT and SIGTERM unless ZSYS_SIGHANDLER=false
     if ((getenv ("ZSYS_SIGHANDLER") == NULL
-        ||  strneq (getenv ("ZSYS_SIGHANDLER"), "false")) && handle_signals)
+    ||   strneq (getenv ("ZSYS_SIGHANDLER"), "false"))
+    &&   handle_signals)
         zsys_handler_set (s_signal_handler);
 }
 
@@ -523,7 +629,20 @@ zsys_file_size (const char *filename)
 
 
 //  --------------------------------------------------------------------------
-//  Return file modification time. Returns 0 if the file does not exist.
+//  Return file modification time (accounted in seconds usually since
+//  UNIX Epoch, with granularity dependent on underlying filesystem,
+//  and starting point dependent on host OS and maybe its bitness).
+//  Per https://msdn.microsoft.com/en-us/library/w4ddyt9h(vs.71).aspx :
+//      Note   In all versions of Microsoft C/C++ except Microsoft C/C++
+//      version 7.0, and in all versions of Microsoft Visual C++, the time
+//      function returns the current time as the number of seconds elapsed
+//      since midnight on January 1, 1970. In Microsoft C/C++ version 7.0,
+//      time() returned the current time as the number of seconds elapsed
+//      since midnight on December 31, 1899.
+//  This value is "arithmetic" with no big guarantees in the standards, and
+//  normally it should be manipulated with host's datetime suite of routines,
+//  including difftime(), or converted to "struct tm" for any predictable use.
+//  Returns 0 if the file does not exist.
 
 time_t
 zsys_file_modified (const char *filename)
@@ -589,24 +708,63 @@ zsys_file_delete (const char *filename)
 //  --------------------------------------------------------------------------
 //  Check if file is 'stable'
 
-bool
-zsys_file_stable (const char *filename)
+// Internal implementation rigged with debugs and called from selftest
+static bool
+s_zsys_file_stable (const char *filename, bool verbose)
 {
     struct stat stat_buf;
     if (stat (filename, &stat_buf) == 0) {
-        //  File is 'stable' if more than 1 second old
+        //  File is 'stable' if older (per filesystem stats) than a threshold.
+        //  This used to mean more than 1 second old, counted in microseconds
+        //  after inflating the st_mtime data - but this way of calculation
+        //  has a caveat: if we created the file at Nsec.999msec, or rather
+        //  the FS metadata was updated at that point, the st_mtime will be
+        //  (after inflation) N.000. So a few milliseconds later, at (N+1)sec,
+        //  we find the age difference seems over 1000 so the file is 1 sec
+        //  old - even though it has barely been created. Compounding the
+        //  issue, some filesystems have worse timestamp precision - e.g. the
+        //  FAT filesystem variants are widespread (per SD standards) on
+        //  removable media, and only account even seconds in stat data.
+        //  Solutions are two-fold: when using stat fields that are precise
+        //  to a second (or inpredictably two), we should actually check for
+        //  (age > 3000+) in rounded-microsecond accounting. Also, for some
+        //  systems we can have `configure`-time checks on presence of more
+        //  precise (and less standardized) stat timestamp fields, where we
+        //  can presumably avoid rounding to thousands and use (age > 2000).
+        //  It might also help to define a zsys_file_modified_msec() whose
+        //  actual granularity will be OS-dependent (rounded to 1000 or not).
+        //  These are TODO ideas for subsequent work.
+
 #if (defined (WIN32))
 #   define EPOCH_DIFFERENCE 11644473600LL
         long age = (long) (zclock_time () - EPOCH_DIFFERENCE * 1000 - (stat_buf.st_mtime * 1000));
+        if (verbose)
+            zsys_debug ("zsys_file_stable@WIN32: file '%s' age is %ld msec "
+                "at timestamp %" PRIi64 " where st_mtime was %jd adjusted by %jd",
+                filename, age, zclock_time (), (intmax_t)(stat_buf.st_mtime * 1000),
+                (intmax_t)(EPOCH_DIFFERENCE * 1000) );
 #else
         long age = (long) (zclock_time () - (stat_buf.st_mtime * 1000));
+        if (verbose)
+            zsys_debug ("zsys_file_stable@non-WIN32: file '%s' age is %ld msec "
+                "at timestamp %" PRIi64 " where st_mtime was %jd",
+                filename, age, zclock_time (), (intmax_t)(stat_buf.st_mtime * 1000) );
 #endif
-        return (age > 1000);
+        return (age > s_file_stable_age_msec);
     }
-    else
+    else {
+        if (verbose)
+            zsys_debug ("zsys_file_stable: could not stat file '%s'", filename);
         return false;           //  File doesn't exist, so not stable
+    }
 }
 
+// Public implementation does not do debugs
+bool
+zsys_file_stable (const char *filename)
+{
+    return s_zsys_file_stable(filename, false);
+}
 
 //  --------------------------------------------------------------------------
 //  Create a file path if it doesn't exist. The file path is treated as a
@@ -635,7 +793,7 @@ zsys_dir_create (const char *pathname, ...)
 #else
             if (mkdir (formatted, 0775)) {
 #endif
-                free (formatted);
+                freen (formatted);
                 return -1;      //  Failed
             }
         }
@@ -648,7 +806,7 @@ zsys_dir_create (const char *pathname, ...)
         *slash = '/';
         slash = strchr (slash + 1, '/');
     }
-    free (formatted);
+    zstr_free (&formatted);
     return 0;
 }
 
@@ -671,7 +829,7 @@ zsys_dir_delete (const char *pathname, ...)
 #else
     int rc = rmdir (formatted);
 #endif
-    free (formatted);
+    zstr_free (&formatted);
     return rc;
 }
 
@@ -790,7 +948,7 @@ zsys_vprintf (const char *format, va_list argptr)
     //  larger buffer for it.
     if (required >= size) {
         size = required + 1;
-        free (string);
+        freen (string);
         string = (char *) malloc (size);
         if (string) {
             va_copy (my_argptr, argptr);
@@ -812,7 +970,11 @@ zsys_udp_new (bool routable)
 {
     //  We haven't implemented multicast yet
     assert (!routable);
-    SOCKET udpsock = socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKET udpsock;
+    if (zsys_ipv6 ())
+        udpsock = socket (AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    else
+        udpsock = socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udpsock == INVALID_SOCKET) {
         zsys_socket_error ("socket");
         return INVALID_SOCKET;
@@ -858,7 +1020,7 @@ zsys_udp_close (SOCKET handle)
 //  interface having disappeared (happens easily with WiFi)
 
 int
-zsys_udp_send (SOCKET udpsock, zframe_t *frame, inaddr_t *address)
+zsys_udp_send (SOCKET udpsock, zframe_t *frame, inaddr_t *address, int addrlen)
 {
     assert (frame);
     assert (address);
@@ -866,7 +1028,7 @@ zsys_udp_send (SOCKET udpsock, zframe_t *frame, inaddr_t *address)
     if (sendto (udpsock,
         (char *) zframe_data (frame), (int) zframe_size (frame),
         0, //  Flags
-        (struct sockaddr *) address, (int) sizeof (inaddr_t)) == -1) {
+        (struct sockaddr *) address, addrlen) == -1) {
         zsys_debug ("zsys_udp_send: failed, reason=%s", strerror (errno));
         return -1;              //  UDP broadcast not possible
     }
@@ -877,30 +1039,49 @@ zsys_udp_send (SOCKET udpsock, zframe_t *frame, inaddr_t *address)
 
 //  --------------------------------------------------------------------------
 //  Receive zframe from UDP socket, and set address of peer that sent it
-//  The peername must be a char [INET_ADDRSTRLEN] array.
+//  The peername must be a char [INET_ADDRSTRLEN] array if IPv6 is disabled or
+//  NI_MAXHOST if it's enabled. Returns NULL when failing to get peer address.
 
 zframe_t *
-zsys_udp_recv (SOCKET udpsock, char *peername)
+zsys_udp_recv (SOCKET udpsock, char *peername, int peerlen)
 {
     char buffer [UDP_FRAME_MAX];
-    inaddr_t address;
-    socklen_t address_len = sizeof (inaddr_t);
+    in6addr_t address6;
+    socklen_t address_len = sizeof (in6addr_t);
     ssize_t size = recvfrom (
         udpsock,
         buffer, UDP_FRAME_MAX,
         0,      //  Flags
-        (struct sockaddr *) &address, &address_len);
+        (struct sockaddr *) &address6, &address_len);
 
     if (size == SOCKET_ERROR)
         zsys_socket_error ("recvfrom");
 
     //  Get sender address as printable string
-#if (defined (__WINDOWS__))
-    getnameinfo ((struct sockaddr *) &address, address_len,
-                 peername, INET_ADDRSTRLEN, NULL, 0, NI_NUMERICHOST);
-#else
-    inet_ntop (AF_INET, &address.sin_addr, peername, address_len);
+    int rc = getnameinfo ((struct sockaddr *) &address6, address_len,
+                 peername, peerlen, NULL, 0, NI_NUMERICHOST);
+
+    if (rc) {
+        zsys_warning ("zsys_udp_recv: getnameinfo failed, reason=%s",
+                gai_strerror (rc));
+        return NULL;
+    }
+
+    //  Some platform's getnameinfo, like Solaris, appear not to append the
+    //  interface name when parsing a link-local IPv6 address. These addresses
+    //  cannot be used without the interface, so we must append it manually.
+    //  On Windows, if_indextoname is only available from Vista.
+#if !defined (__WINDOWS__) || (_WIN32_WINNT >= 0x0600)
+    if (address6.sin6_family == AF_INET6 &&
+            IN6_IS_ADDR_LINKLOCAL (&address6.sin6_addr) &&
+            !strchr (peername, '%')) {
+        char ifname [IF_NAMESIZE] = {0};
+        if_indextoname (address6.sin6_scope_id, ifname);
+        strcat (peername, "%");
+        strcat (peername, ifname);
+    }
 #endif
+
     return zframe_new (buffer, size);
 }
 
@@ -912,6 +1093,8 @@ zsys_udp_recv (SOCKET udpsock, char *peername)
 void
 zsys_socket_error (const char *reason)
 {
+    bool check_errno;
+
 #if defined (__WINDOWS__)
     switch (WSAGetLastError ()) {
         case WSAEINTR:        errno = EINTR;      break;
@@ -923,35 +1106,39 @@ zsys_socket_error (const char *reason)
         case WSAECONNABORTED: errno = EPIPE;      break;
         case WSAESHUTDOWN:    errno = ECONNRESET; break;
         case WSAEINVAL:       errno = EPIPE;      break;
+        case WSAEADDRNOTAVAIL: errno = EADDRNOTAVAIL; break;
+        case WSAEADDRINUSE:   errno = EADDRINUSE; break;
         default:              errno = GetLastError ();
     }
 #endif
-    if (errno == EAGAIN
-    ||  errno == ENETDOWN
-    ||  errno == EHOSTUNREACH
-    ||  errno == ENETUNREACH
-    ||  errno == EINTR
-    ||  errno == EPIPE
-    ||  errno == ECONNRESET
+
+    check_errno = (errno == EAGAIN
+                  ||  errno == ENETDOWN
+                  ||  errno == EHOSTUNREACH
+                  ||  errno == ENETUNREACH
+                  ||  errno == EINTR
+                  ||  errno == EPIPE
+                  ||  errno == ECONNRESET);
 #if defined (ENOPROTOOPT)
-    ||  errno == ENOPROTOOPT
+    check_errno = (check_errno ||  errno == ENOPROTOOPT);
 #endif
 #if defined (EHOSTDOWN)
-    ||  errno == EHOSTDOWN
+    check_errno = (check_errno ||  errno == EHOSTDOWN);
 #endif
 #if defined (EOPNOTSUPP)
-    ||  errno == EOPNOTSUPP
+    check_errno = (check_errno ||  errno == EOPNOTSUPP);
 #endif
 #if defined (EWOULDBLOCK)
-    ||  errno == EWOULDBLOCK
+    check_errno = (check_errno ||  errno == EWOULDBLOCK);
 #endif
 #if defined (EPROTO)
-    ||  errno == EPROTO
+    check_errno = (check_errno ||  errno == EPROTO);
 #endif
 #if defined (ENONET)
-    ||  errno == ENONET
+    check_errno = (check_errno ||  errno == ENONET);
 #endif
-    )
+
+    if (check_errno)
         return;             //  Ignore error and try again
     else {
         zsys_error ("(UDP) error '%s' on %s", strerror (errno), reason);
@@ -1071,9 +1258,9 @@ zsys_run_as (const char *lockfile, const char *group, const char *user)
             }
         }
         //   We record the current process id in the lock file
-        char pid_buffer [10];
-        snprintf (pid_buffer, sizeof (pid_buffer), "%6d\n", getpid ());
-        if (write (handle, pid_buffer, strlen (pid_buffer)) != strlen (pid_buffer)) {
+        char pid_buffer [32];
+        snprintf (pid_buffer, sizeof (pid_buffer), "%6" PRIi64 "\n", (int64_t)getpid ());
+        if ((size_t) write (handle, pid_buffer, strlen (pid_buffer)) != strlen (pid_buffer)) {
             zsys_error ("cannot write to lockfile: %s", strerror (errno));
             close (handle);
             return -1;
@@ -1166,6 +1353,57 @@ zsys_set_io_threads (size_t io_threads)
     zmq_ctx_set (s_process_ctx, ZMQ_MAX_SOCKETS, (int) s_max_sockets);
 #endif
     ZMUTEX_UNLOCK (s_mutex);
+    zsys_set_max_msgsz (s_max_msgsz);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Configure the scheduling policy of the ZMQ context thread pool.
+//  Not available on Windows. See the sched_setscheduler man page or sched.h
+//  for more information. If the environment variable ZSYS_THREAD_SCHED_POLICY
+//  is defined, that provides the default.
+//  Note that this method is valid only before any socket is created.
+
+void
+zsys_set_thread_sched_policy (int policy)
+{
+    zsys_init ();
+    ZMUTEX_LOCK (s_mutex);
+    //  If the app is misusing this method, burn it with fire
+    if (s_open_sockets)
+        zsys_error ("zsys_set_thread_sched_policy() is not valid after"
+                " creating sockets");
+    assert (s_open_sockets == 0);
+    s_thread_sched_policy = policy;
+#if defined (ZMQ_THREAD_SCHED_POLICY)
+    zmq_ctx_set (s_process_ctx, ZMQ_THREAD_SCHED_POLICY, s_thread_sched_policy);
+#endif
+    ZMUTEX_UNLOCK (s_mutex);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Configure the scheduling priority of the ZMQ context thread pool.
+//  Not available on Windows. See the sched_setscheduler man page or sched.h
+//  for more information. If the environment variable ZSYS_THREAD_PRIORITY is
+//  defined, that provides the default.
+//  Note that this method is valid only before any socket is created.
+
+void
+zsys_set_thread_priority (int priority)
+{
+    zsys_init ();
+    ZMUTEX_LOCK (s_mutex);
+    //  If the app is misusing this method, burn it with fire
+    if (s_open_sockets)
+        zsys_error ("zsys_set_thread_priority() is not valid after"
+                " creating sockets");
+    assert (s_open_sockets == 0);
+    s_thread_priority = priority;
+#if defined (ZMQ_THREAD_PRIORITY)
+    zmq_ctx_set (s_process_ctx, ZMQ_THREAD_PRIORITY, s_thread_priority);
+#endif
+    ZMUTEX_UNLOCK (s_mutex);
 }
 
 
@@ -1216,6 +1454,82 @@ zsys_socket_limit (void)
     socket_limit = 1024;
 #endif
     return socket_limit;
+}
+
+
+//  --------------------------------------------------------------------------
+//  Configure the maximum allowed size of a message sent.
+//  The default is INT_MAX.
+
+void
+zsys_set_max_msgsz (int max_msgsz)
+{
+    if (max_msgsz < 0)
+        return;
+
+    zsys_init ();
+    ZMUTEX_LOCK (s_mutex);
+    s_max_msgsz = max_msgsz;
+#if defined (ZMQ_MAX_MSGSZ)
+    zmq_ctx_set (s_process_ctx, ZMQ_MAX_MSGSZ, (int) s_max_msgsz);
+#endif
+    ZMUTEX_UNLOCK (s_mutex);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Return maximum message size.
+
+int
+zsys_max_msgsz (void)
+{
+    zsys_init ();
+    ZMUTEX_LOCK (s_mutex);
+#if defined (ZMQ_MAX_MSGSZ)
+    s_max_msgsz = zmq_ctx_get (s_process_ctx, ZMQ_MAX_MSGSZ);
+#endif
+    ZMUTEX_UNLOCK (s_mutex);
+    return s_max_msgsz;
+}
+
+
+//  --------------------------------------------------------------------------
+//  Configure the threshold value of filesystem object age per st_mtime
+//  that should elapse until we consider that object "stable" at the
+//  current zclock_time() moment.
+//  The default is S_DEFAULT_ZSYS_FILE_STABLE_AGE_MSEC defined in zsys.c
+//  which generally depends on host OS, with fallback value of 5000.
+
+void
+    zsys_set_file_stable_age_msec (int64_t file_stable_age_msec)
+{
+    if (file_stable_age_msec < 1)
+        return;
+
+    zsys_init ();
+    ZMUTEX_LOCK (s_mutex);
+    s_file_stable_age_msec = file_stable_age_msec;
+    ZMUTEX_UNLOCK (s_mutex);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Return current threshold value of file stable age in msec.
+//  This can be used in code that chooses to wait for this timeout
+//  before testing if a filesystem object is "stable" or not.
+
+//  Note that the OS timer quantization can bite you, so it may be
+//  reasonably safe to sleep/wait/poll for a larger timeout before
+//  assuming a fault, e.g. the default timer resolution on Windows
+//  is 15.6 ms (per timer interrupt 64 times a second), graphed here:
+//    https://msdn.microsoft.com/en-us/library/windows/desktop/dn553408(v=vs.85).aspx
+//  and Unix/Linux OSes also have different-resolution timers.
+
+int64_t
+    zsys_file_stable_age_msec (void)
+{
+    zsys_init ();
+    return s_file_stable_age_msec;
 }
 
 
@@ -1316,6 +1630,16 @@ zsys_set_ipv6 (int ipv6)
 
 
 //  --------------------------------------------------------------------------
+//  Return use of IPv6 for zsock instances.
+
+int
+zsys_ipv6 (void)
+{
+    return s_ipv6;
+}
+
+
+//  --------------------------------------------------------------------------
 //  Set network interface name to use for broadcasts, particularly zbeacon.
 //  This lets the interface be configured for test environments where required.
 //  For example, on Mac OS X, zbeacon cannot bind to 255.255.255.255 which is
@@ -1327,7 +1651,7 @@ void
 zsys_set_interface (const char *value)
 {
     zsys_init ();
-    free (s_interface);
+    freen (s_interface);
     s_interface = strdup (value);
     assert (s_interface);
 }
@@ -1344,6 +1668,88 @@ zsys_interface (void)
 
 
 //  --------------------------------------------------------------------------
+//  Set IPv6 address to use zbeacon socket, particularly for receiving zbeacon.
+//  This needs to be set IPv6 is enabled as IPv6 can have multiple addresses
+//  on a given interface. If the environment variable ZSYS_IPV6_ADDRESS is set,
+//  use that as the default IPv6 address.
+
+void
+zsys_set_ipv6_address (const char *value)
+{
+    zsys_init ();
+    freen (s_ipv6_address);
+    s_ipv6_address = strdup (value);
+    assert (s_ipv6_address);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Return IPv6 address to use for zbeacon reception, or "" if none was set.
+
+const char *
+zsys_ipv6_address (void)
+{
+    return s_ipv6_address? s_ipv6_address: "";
+}
+
+
+//  --------------------------------------------------------------------------
+//  Set IPv6 multicast address to use for sending zbeacon messages. The default
+//  is fe02::1 (link-local all-node). If the environment variable
+//  ZSYS_IPV6_MCAST_ADDRESS is set, use that as the default IPv6 multicast
+//  address.
+
+void
+zsys_set_ipv6_mcast_address (const char *value)
+{
+    zsys_init ();
+    freen (s_ipv6_mcast_address);
+    s_ipv6_mcast_address = strdup (value);
+    assert (s_ipv6_mcast_address);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Return IPv6 multicast address to use for sending zbeacon, or
+//  "ff02:0:0:0:0:0:0:1" if none was set.
+
+const char *
+zsys_ipv6_mcast_address (void)
+{
+    return s_ipv6_mcast_address ? s_ipv6_mcast_address : "ff02:0:0:0:0:0:0:1";
+}
+
+
+//  --------------------------------------------------------------------------
+//  Configure the automatic use of pre-allocated FDs when creating new sockets.
+//  If 0 (default), nothing will happen. Else, when a new socket is bound, the
+//  system API will be used to check if an existing pre-allocated FD with a
+//  matching port (if TCP) or path (if IPC) exists, and if it does it will be
+//  set via the ZMQ_USE_FD socket option so that the library will use it
+//  instead of creating a new socket.
+
+
+void
+zsys_set_auto_use_fd (int auto_use_fd)
+{
+    zsys_init ();
+    ZMUTEX_LOCK (s_mutex);
+    s_auto_use_fd = auto_use_fd;
+    ZMUTEX_UNLOCK (s_mutex);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Return use of automatic pre-allocated FDs for zsock instances.
+
+int
+zsys_auto_use_fd (void)
+{
+    return s_auto_use_fd;
+}
+
+
+//  --------------------------------------------------------------------------
 //  Set log identity, which is a string that prefixes all log messages sent
 //  by this process. The log identity defaults to the environment variable
 //  ZSYS_LOGIDENT, if that is set.
@@ -1352,7 +1758,7 @@ void
 zsys_set_logident (const char *value)
 {
     zsys_init ();
-    free (s_logident);
+    freen (s_logident);
     s_logident = strdup (value);
 #if defined (__UNIX__)
     if (s_logsystem)
@@ -1397,7 +1803,7 @@ zsys_set_logsender (const char *endpoint)
             assert (s_logsender);
         }
         //  Bind/connect to specified endpoint(s) using zsock_attach() syntax
-	int rc = zsock_attach (s_logsender, endpoint, true);
+        int rc = zsock_attach (s_logsender, endpoint, true);
         assert (rc == 0);
     }
     else
@@ -1470,10 +1876,6 @@ s_log (char loglevel, char *string)
     else
 #   endif
 #endif
-    //  Set s_logstream to stdout by default, unless we're using s_logsystem
-    if (!s_logstream)
-        s_logstream = stdout;
-
     if (s_logstream || s_logsender) {
         time_t curtime = time (NULL);
         struct tm *loctime = localtime (&curtime);
@@ -1506,7 +1908,7 @@ zsys_error (const char *format, ...)
     char *string = zsys_vprintf (format, argptr);
     va_end (argptr);
     s_log ('E', string);
-    free (string);
+    zstr_free (&string);
 }
 
 
@@ -1521,7 +1923,7 @@ zsys_warning (const char *format, ...)
     char *string = zsys_vprintf (format, argptr);
     va_end (argptr);
     s_log ('W', string);
-    free (string);
+    zstr_free (&string);
 }
 
 
@@ -1536,7 +1938,7 @@ zsys_notice (const char *format, ...)
     char *string = zsys_vprintf (format, argptr);
     va_end (argptr);
     s_log ('N', string);
-    free (string);
+    zstr_free (&string);
 }
 
 
@@ -1551,7 +1953,7 @@ zsys_info (const char *format, ...)
     char *string = zsys_vprintf (format, argptr);
     va_end (argptr);
     s_log ('I', string);
-    free (string);
+    zstr_free (&string);
 }
 
 
@@ -1566,7 +1968,7 @@ zsys_debug (const char *format, ...)
     char *string = zsys_vprintf (format, argptr);
     va_end (argptr);
     s_log ('D', string);
-    free (string);
+    zstr_free (&string);
 }
 
 
@@ -1580,26 +1982,52 @@ zsys_test (bool verbose)
     if (verbose)
         printf ("\n");
 
+    // check that we can stop/restart the environnemnt
+    zsys_shutdown();
+    zsys_init();
+    zsys_shutdown();
+    zsys_init();
+
+
     //  @selftest
     zsys_catch_interrupts ();
 
     //  Check capabilities without using the return value
     int rc = zsys_has_curve ();
 
+    // Note: If your selftest reads SCMed fixture data, please keep it in
+    // src/selftest-ro; if your test creates filesystem objects, please
+    // do so under src/selftest-rw. They are defined below along with a
+    // usecase for the variables (assert) to make compilers happy.
+    const char *SELFTEST_DIR_RO = "src/selftest-ro";
+    const char *SELFTEST_DIR_RW = "src/selftest-rw";
+    assert (SELFTEST_DIR_RO);
+    assert (SELFTEST_DIR_RW);
+    // Uncomment these to use C++ strings in C++ selftest code:
+    //std::string str_SELFTEST_DIR_RO = std::string(SELFTEST_DIR_RO);
+    //std::string str_SELFTEST_DIR_RW = std::string(SELFTEST_DIR_RW);
+    //assert ( (str_SELFTEST_DIR_RO != "") );
+    //assert ( (str_SELFTEST_DIR_RW != "") );
+    // NOTE that for "char*" context you need (str_SELFTEST_DIR_RO + "/myfilename").c_str()
+
     if (verbose) {
         char *hostname = zsys_hostname ();
         zsys_info ("host name is %s", hostname);
-        free (hostname);
+        freen (hostname);
         zsys_info ("system limit is %zu ZeroMQ sockets", zsys_socket_limit ());
     }
-    zsys_set_io_threads (1);
-    zsys_set_max_sockets (0);
+    zsys_set_file_stable_age_msec (5123);
+    assert (zsys_file_stable_age_msec() == 5123);
+    zsys_set_file_stable_age_msec (-1);
+    assert (zsys_file_stable_age_msec() == 5123);
     zsys_set_linger (0);
     zsys_set_sndhwm (1000);
     zsys_set_rcvhwm (1000);
     zsys_set_pipehwm (2500);
     assert (zsys_pipehwm () == 2500);
     zsys_set_ipv6 (0);
+    zsys_set_thread_priority (-1);
+    zsys_set_thread_sched_policy (-1);
 
     //  Test pipe creation
     zsock_t *pipe_back;
@@ -1607,11 +2035,18 @@ zsys_test (bool verbose)
     zstr_send (pipe_front, "Hello");
     char *string = zstr_recv (pipe_back);
     assert (streq (string, "Hello"));
-    free (string);
+    freen (string);
     zsock_destroy (&pipe_back);
     zsock_destroy (&pipe_front);
 
     //  Test file manipulation
+
+    // Don't let anyone fool our workspace
+    if (zsys_file_exists ("nosuchfile")) {
+        zsys_warning ("zsys_test() had to remove 'nosuchfile' which was not expected here at all");
+        zsys_file_delete ("nosuchfile");
+    }
+
     rc = zsys_file_delete ("nosuchfile");
     assert (rc == -1);
 
@@ -1629,19 +2064,103 @@ zsys_test (bool verbose)
     assert (mode & S_IRUSR);
     assert (mode & S_IWUSR);
 
+    const char *testbasedir  = ".testsys";
+    const char *testsubdir  = "subdir";
+    char *basedirpath = NULL;   // subdir in a test, under SELFTEST_DIR_RW
+    char *dirpath = NULL;       // subdir in a test, under basedirpath
+    char *relsubdir = NULL;     // relative short "path" of subdir under testbasedir
+
+    basedirpath = zsys_sprintf ("%s/%s", SELFTEST_DIR_RW, testbasedir);
+    assert (basedirpath);
+    dirpath = zsys_sprintf ("%s/%s", basedirpath, testsubdir);
+    assert (dirpath);
+    relsubdir = zsys_sprintf ("%s/%s", testbasedir, testsubdir);
+    assert (relsubdir);
+
+    // Normally tests clean up in the end, but if a selftest run dies
+    // e.g. on assert(), workspace remains dirty. Better clean it up.
+    // We do not really care about results here - we clean up a possible
+    // dirty exit of an older build. If there are permission errors etc.
+    // the actual tests below would explode.
+    if (zsys_file_exists(dirpath)) {
+        if (verbose)
+            zsys_debug ("zsys_test() has to remove ./%s that should not have been here", dirpath);
+        zsys_dir_delete (dirpath);
+    }
+    if (zsys_file_exists (basedirpath)) {
+        if (verbose)
+            zsys_debug ("zsys_test() has to remove ./%s that should not have been here", basedirpath);
+        zsys_dir_delete (basedirpath);
+    }
+
+    // Added tracing because this file-age check fails on some systems
+    // presumably due to congestion in a mass-build and valgrind on top
     zsys_file_mode_private ();
-    rc = zsys_dir_create ("%s/%s", ".", ".testsys/subdir");
+    if (verbose)
+        printf ("zsys_test() at timestamp %" PRIi64 ": "
+            "Creating %s\n",
+            zclock_time(), relsubdir );
+    rc = zsys_dir_create ("%s/%s", SELFTEST_DIR_RW, relsubdir);
+    if (verbose)
+        printf ("zsys_test() at timestamp %" PRIi64 ": "
+            "Finished creating %s with return-code %d\n",
+            zclock_time(), relsubdir, rc );
     assert (rc == 0);
-    when = zsys_file_modified ("./.testsys/subdir");
+    when = zsys_file_modified (dirpath);
+    if (verbose)
+        printf ("zsys_test() at timestamp %" PRIi64 ": "
+            "Finished calling zsys_file_modified(), got age %jd\n",
+            zclock_time(), (intmax_t)when );
     assert (when > 0);
-    assert (!zsys_file_stable ("./.testsys/subdir"));
-    rc = zsys_dir_delete ("%s/%s", ".", ".testsys/subdir");
+    if (verbose)
+        printf ("zsys_test() at timestamp %" PRIi64 ": "
+            "Checking if file is NOT stable (is younger than 1 sec)\n",
+            zclock_time() );
+    assert (!s_zsys_file_stable (dirpath, verbose));
+    if (verbose)
+        printf ("zsys_test() at timestamp %" PRIi64 ": "
+            "Passed the test, file is not stable - as expected\n",
+            zclock_time() );
+    rc = zsys_dir_delete ("%s/%s", SELFTEST_DIR_RW, relsubdir);
     assert (rc == 0);
-    rc = zsys_dir_delete ("%s/%s", ".", ".testsys");
+    rc = zsys_dir_delete ("%s/%s", SELFTEST_DIR_RW, testbasedir);
     assert (rc == 0);
     zsys_file_mode_default ();
-    assert (zsys_dir_change (".") == 0);
 
+#if (defined (PATH_MAX))
+    char cwd[PATH_MAX];
+#else
+# if (defined (_MAX_PATH))
+    char cwd[_MAX_PATH];
+# else
+    char cwd[1024];
+# endif
+#endif
+    memset (cwd, 0, sizeof(cwd));
+#if (defined (WIN32))
+    if (_getcwd(cwd, sizeof(cwd)) != NULL) {
+#else
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+#endif
+        if (verbose)
+            printf ("zsys_test() at timestamp %" PRIi64 ": "
+                "current working directory is %s\n",
+                zclock_time(), cwd);
+        assert (zsys_dir_change (SELFTEST_DIR_RW) == 0);
+        assert (zsys_dir_change (cwd) == 0);
+    }
+    else {
+        zsys_warning ("zsys_test() : got getcwd() error... "
+            "testing zsys_dir_change() anyway, but it can confuse "
+            "subsequent tests in this process");
+        assert (zsys_dir_change (SELFTEST_DIR_RW) == 0);
+    }
+
+    zstr_free (&basedirpath);
+    zstr_free (&dirpath);
+    zstr_free (&relsubdir);
+
+    // Other subtests
     int major, minor, patch;
     zsys_version (&major, &minor, &patch);
     assert (major == CZMQ_VERSION_MAJOR);
@@ -1650,13 +2169,13 @@ zsys_test (bool verbose)
 
     string = zsys_sprintf ("%s %02x", "Hello", 16);
     assert (streq (string, "Hello 10"));
-    free (string);
+    freen (string);
 
     char *str64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890,.";
     int num10 = 1234567890;
     string = zsys_sprintf ("%s%s%s%s%d", str64, str64, str64, str64, num10);
     assert (strlen (string) == (4 * 64 + 10));
-    free (string);
+    freen (string);
 
     //  Test logging system
     zsys_set_logident ("czmq_selftest");
@@ -1685,6 +2204,20 @@ zsys_test (bool verbose)
     }
     zsys_close (logger, NULL, 0);
     //  @end
+
+    zsys_set_auto_use_fd (1);
+    assert (zsys_auto_use_fd () == 1);
+
+    assert (zsys_max_msgsz () == INT_MAX);
+    zsys_set_max_msgsz (2000);
+    assert (zsys_max_msgsz () == 2000);
+    zsys_set_max_msgsz (-1);
+    assert (zsys_max_msgsz () == 2000);
+
+
+#if defined (__WINDOWS__)
+    zsys_shutdown();
+#endif
 
     printf ("OK\n");
 }

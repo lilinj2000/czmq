@@ -24,7 +24,6 @@
 @end
 */
 
-#include "../include/czmq.h"
 #include "czmq_classes.h"
 
 #define MODE_INSERT 0
@@ -39,8 +38,9 @@
 #define MIN_LEN(x,y) \
     y + ((x - y) & ((x - y) >>(sizeof(int) * CHAR_BIT - 1)))
 
+
 // TODO: Move to a more appropriate location:
-char *
+static char *
 s_strndup (const char *s, size_t size) {
     char *dup;
     char *end = (char *) memchr (s, '\0', size);
@@ -129,9 +129,10 @@ s_ztrie_node_new (ztrie_node_t *parent, char *token, int token_len, zlistx_t *pa
         self->parameter_names = (char **) malloc (sizeof (char *) * self->parameter_count);
         self->parameter_values = (char **) malloc (sizeof (char *) * self->parameter_count);
         char *key = (char *) zlistx_first (param_keys);
-        for (int i = 0; i < zlistx_size (param_keys); i++) {
-            self->parameter_names [i] = key;
-            self->parameter_values [i] = NULL;
+        size_t index;
+        for (index = 0; index < zlistx_size (param_keys); index++) {
+            self->parameter_names [index] = key;
+            self->parameter_values [index] = NULL;
             key = (char *) zlistx_next (param_keys);
         }
     }
@@ -145,7 +146,7 @@ s_ztrie_node_new (ztrie_node_t *parent, char *token, int token_len, zlistx_t *pa
         //  Sort regexes to the end to avoid conlficts
         zlistx_sort (self->parent->children);
     }
-    size_t parent_path_len = self->parent ? self->parent->path_len : 0;
+    size_t parent_path_len = self->parent? self->parent->path_len: 0;
     self->path_len = parent_path_len + strlen (self->token) + 1; // +1 path delimiter
     self->children = zlistx_new ();
     zlistx_set_comparator (self->children, s_ztrie_node_compare);
@@ -167,13 +168,14 @@ s_ztrie_node_destroy (ztrie_node_t **self_p)
         zstr_free (&self->token);
         zstr_free (&self->asterisk_match);
         if (self->parameter_count > 0) {
-            for (int i = 0; i < self->parameter_count; i++) {
-                free (self->parameter_names [i]);
-                if (self->parameter_values [i])
-                    free (self->parameter_values [i]);
+            size_t index;
+            for (index = 0; index < self->parameter_count; index++) {
+                freen (self->parameter_names [index]);
+                if (self->parameter_values [index])
+                    freen (self->parameter_values [index]);
             }
-            free (self->parameter_names);
-            free (self->parameter_values);
+            freen (self->parameter_names);
+            freen (self->parameter_values);
         }
         if (self->token_type == NODE_TYPE_REGEX || self->token_type == NODE_TYPE_PARAM)
             zrex_destroy (&self->regex);
@@ -182,7 +184,7 @@ s_ztrie_node_destroy (ztrie_node_t **self_p)
             (self->destroy_data_fn) (&self->data);
 
         //  Free object itself
-        free (self);
+        freen (self);
         *self_p = NULL;
     }
 }
@@ -194,6 +196,7 @@ static void
 s_ztrie_node_update_param (ztrie_node_t *self, int pos, const char *value)
 {
     assert (self);
+    zstr_free (&self->parameter_values [pos - 1]);
     self->parameter_values [pos - 1] = strdup (value);
 }
 
@@ -248,7 +251,7 @@ ztrie_destroy (ztrie_t **self_p)
         zlistx_destroy (&self->params);
 
         //  Free object itself
-        free (self);
+        freen (self);
         *self_p = NULL;
     }
 }
@@ -273,7 +276,6 @@ s_ztrie_compare_token (ztrie_node_t *parent, char *token, int len)
 static ztrie_node_t *
 s_ztrie_matches_token (ztrie_node_t *parent, char *token, int len)
 {
-    unsigned int i;
     char firstbyte = *token;
     ztrie_node_t *child = (ztrie_node_t *) zlistx_first (parent->children);
     while (child) {
@@ -299,14 +301,16 @@ s_ztrie_matches_token (ztrie_node_t *parent, char *token, int len)
                     if (zrex_hits (child->regex) == 1)
                         s_ztrie_node_update_param (child, 1, zrex_hit (child->regex, 0));
                     else
-                    if (zrex_hits (child->regex) > 1)
-                        for (i = 1; i < zrex_hits (child->regex); i++)
-                            s_ztrie_node_update_param (child, i, zrex_hit (child->regex, i));
+                    if (zrex_hits (child->regex) > 1) {
+                        int index;
+                        for (index = 1; index < zrex_hits (child->regex); index++)
+                            s_ztrie_node_update_param (child, index, zrex_hit (child->regex, index));
+                    }
                 }
-                free (token_term);
+                freen (token_term);
                 return child;
             }
-            free (token_term);
+            freen (token_term);
         }
         child = (ztrie_node_t *) zlistx_next (parent->children);
     }
@@ -330,7 +334,7 @@ s_ztrie_matches_token (ztrie_node_t *parent, char *token, int len)
 //    MODE_MATCH:  returns NULL if the comparison failed.
 
 static ztrie_node_t *
-s_ztrie_parse_path (ztrie_t *self, char *path, int mode)
+s_ztrie_parse_path (ztrie_t *self, const char *path, int mode)
 {
     int state = 0;
     char *needle, *beginToken = NULL, *beginRegex = NULL;
@@ -338,11 +342,11 @@ s_ztrie_parse_path (ztrie_t *self, char *path, int mode)
     if (zlistx_size (self->params) > 0)
         zlistx_purge (self->params);
 
-    int len = strlen (path);
-    needle = path;
+    size_t len = strlen (path);
+    needle = (char *) path;
     char *needle_stop = needle + len;
     //  Ignore trailing delimiter
-    if (needle[len-1] == self->delimiter)
+    if (needle [len-1] == self->delimiter)
         needle_stop -= 1;
     while (needle < needle_stop + 1) {
         //  It is valid not to have an delimiter at the end of the path
@@ -360,10 +364,10 @@ s_ztrie_parse_path (ztrie_t *self, char *path, int mode)
             //  Token ends with delimiter.
             else
             if (state < 3) {
-                int matchType = zlistx_size (self->params) > 0 ? NODE_TYPE_PARAM :
-                                    beginRegex ? NODE_TYPE_REGEX : NODE_TYPE_STRING;
-                char *matchToken = beginRegex ? beginRegex : beginToken;
-                int matchTokenLen = needle - matchToken - (beginRegex ? 1 : 0);
+                int matchType = zlistx_size (self->params) > 0? NODE_TYPE_PARAM:
+                                    beginRegex? NODE_TYPE_REGEX: NODE_TYPE_STRING;
+                char *matchToken = beginRegex? beginRegex: beginToken;
+                int matchTokenLen = (int) (needle - matchToken) - (beginRegex? 1: 0);
                 //  Illegal token
                 if (matchTokenLen == 0)
                     return NULL;
@@ -380,10 +384,10 @@ s_ztrie_parse_path (ztrie_t *self, char *path, int mode)
                         return NULL;
                 }
                 else {
-                    matchType = zlistx_size (self->params) > 0 ? NODE_TYPE_PARAM :
-                                        beginRegex ? NODE_TYPE_REGEX : NODE_TYPE_STRING;
-                    matchToken = beginRegex ? beginRegex : beginToken;
-                    matchTokenLen = needle - matchToken - (beginRegex ? 1 : 0);
+                    matchType = zlistx_size (self->params) > 0? NODE_TYPE_PARAM:
+                                        beginRegex? NODE_TYPE_REGEX: NODE_TYPE_STRING;
+                    matchToken = beginRegex? beginRegex: beginToken;
+                    matchTokenLen = (int) (needle - matchToken) - (beginRegex? 1: 0);
                 }
 
                 //  In insert and lookup mode only do a string comparison
@@ -460,7 +464,7 @@ s_ztrie_parse_path (ztrie_t *self, char *path, int mode)
 //  the provided data.
 
 int
-ztrie_insert_route (ztrie_t *self, char *path, void *data, ztrie_destroy_data_fn *destroy_data_fn)
+ztrie_insert_route (ztrie_t *self, const char *path, void *data, ztrie_destroy_data_fn destroy_data_fn)
 {
     assert (self);
     ztrie_node_t *node = s_ztrie_parse_path (self, path, MODE_INSERT);
@@ -482,7 +486,7 @@ ztrie_insert_route (ztrie_t *self, char *path, void *data, ztrie_destroy_data_fn
 //  route does not exists, otherwise 0.
 
 int
-ztrie_remove_route (ztrie_t *self, char *path)
+ztrie_remove_route (ztrie_t *self, const char *path)
 {
     assert (self);
     ztrie_node_t *match = s_ztrie_parse_path (self, path, MODE_LOOKUP);
@@ -513,11 +517,11 @@ ztrie_remove_route (ztrie_t *self, char *path)
 //  Returns true if the path matches a route in the tree, otherwise false.
 
 bool
-ztrie_matches (ztrie_t *self, char *path)
+ztrie_matches (ztrie_t *self, const char *path)
 {
     assert (self);
     self->match = s_ztrie_parse_path (self, path, MODE_MATCH);
-    return self->match ? true : false;
+    return self->match? true: false;
 }
 
 
@@ -564,10 +568,11 @@ ztrie_hit_parameters (ztrie_t *self)
         zhashx_t *route_parameters = zhashx_new ();
         ztrie_node_t *node = self->match;
         while (node) {
-            for (int i = 0; i < node->parameter_count; i++)
+            size_t index;
+            for (index = 0; index < node->parameter_count; index++)
                 zhashx_insert (route_parameters,
-                              node->parameter_names [i],
-                              (void *) node->parameter_values [i]);
+                               node->parameter_names [index],
+                               (void *) node->parameter_values [index]);
             node = node->parent;
         }
         return route_parameters;
@@ -592,29 +597,28 @@ ztrie_hit_asterisk_match (ztrie_t *self)
 //  --------------------------------------------------------------------------
 //  Print properties of the ztrie object.
 //
+
 static void
-s_ztrie_print_tree_line (ztrie_node_t *self, bool isEOL)
+s_ztrie_print_tree_line (ztrie_node_t *self, bool end_line)
 {
     if (self->parent) {
         s_ztrie_print_tree_line (self->parent, false);
         if (zlistx_tail (self->parent->children) == self) {
-            if (isEOL)
-                printf ("\u2514\u2500\u2500 ");
+            if (end_line)
+                printf ("`-- ");
             else
                 printf ("    ");
         }
         else {
-            if (isEOL)
-                printf ("\u251C\u2500\u2500 ");
+            if (end_line)
+                printf ("+-- ");
             else
-                printf ("\u2502   ");
+                printf ("|   ");
         }
-        if (isEOL) {
-            char *isEndpoint = self->endpoint ? "true" : "false";
-            printf ("%s (params: %zu, endpoint: %s, type: %d)\n", self->token,
-                                                                 self->parameter_count,
-                                                                 isEndpoint,
-                                                                 self->token_type);
+        if (end_line) {
+            char *is_endpoint = self->endpoint? "true": "false";
+            printf ("%s (params: %zu, endpoint: %s, type: %d)\n",
+                self->token, self->parameter_count, is_endpoint, self->token_type);
         }
     }
 }
@@ -643,7 +647,7 @@ ztrie_print (ztrie_t *self)
 //  Self test of this class.
 
 void
-ztrie_test (int verbose)
+ztrie_test (bool verbose)
 {
     printf (" * ztrie: ");
     //  @selftest
@@ -795,6 +799,10 @@ ztrie_test (int verbose)
 
     zstr_free (&data);
     ztrie_destroy (&self);
+
+#if defined (__WINDOWS__)
+    zsys_shutdown();
+#endif
     //  @end
 
     printf ("OK\n");

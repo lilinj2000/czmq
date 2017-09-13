@@ -10,17 +10,15 @@
      * The XML model used for this code generation: zgossip.xml, or
      * The code generation script that built this file: zproto_server_c
     ************************************************************************
-    Copyright (c) 1991-2012 iMatix Corporation -- http://www.imatix.com                
-    Copyright other contributors as noted in the AUTHORS file.                         
-                                                                                       
-    This file is part of CZMQ, the high-level C binding for 0MQ: http://czmq.zeromq.org
-                                                                                       
-    This Source Code Form is subject to the terms of the Mozilla Public                
-    License, v. 2.0. If a copy of the MPL was not distributed with this                
-    file, You can obtain one at http://mozilla.org/MPL/2.0/.                           
+    Copyright (c) the Contributors as noted in the AUTHORS file.       
+    This file is part of CZMQ, the high-level C binding for 0MQ:       
+    http://czmq.zeromq.org.                                            
+                                                                       
+    This Source Code Form is subject to the terms of the Mozilla Public
+    License, v. 2.0. If a copy of the MPL was not distributed with this
+    file, You can obtain one at http://mozilla.org/MPL/2.0/.           
     =========================================================================
 */
-
 
 //  ---------------------------------------------------------------------------
 //  State machine constants
@@ -85,6 +83,10 @@ typedef struct {
     size_t timeout;             //  Default client expiry timeout
     bool verbose;               //  Verbose logging enabled?
     char *log_prefix;           //  Default log prefix
+
+#ifdef CZMQ_BUILD_DRAFT_API
+    char *auth_zap_domain; // Zap Auth Domain (curve)
+#endif
 } s_server_t;
 
 
@@ -259,7 +261,7 @@ engine_set_log_prefix (client_t *client, const char *string)
 {
     if (client) {
         s_client_t *self = (s_client_t *) client;
-        snprintf (self->log_prefix, sizeof (self->log_prefix) - 1,
+        snprintf (self->log_prefix, sizeof (self->log_prefix),
             "%6d:%-33s", self->unique_id, string);
     }
 }
@@ -376,8 +378,11 @@ s_client_destroy (s_client_t **self_p)
         //  Provide visual clue if application misuses client reference
         engine_set_log_prefix (&self->client, "*** TERMINATED ***");
         client_terminate (&self->client);
-        free (self->hashkey);
-        free (self);
+        freen (self->hashkey);
+#ifdef CZMQ_BUILD_DRAFT_API
+        zstr_free (&self->server->auth_zap_domain);
+#endif
+        freen (self);
         *self_p = NULL;
     }
 }
@@ -719,7 +724,7 @@ s_server_destroy (s_server_t **self_p)
         zsock_destroy (&self->router);
         zconfig_destroy (&self->config);
         zloop_destroy (&self->loop);
-        free (self);
+        freen (self);
         *self_p = NULL;
     }
 }
@@ -761,6 +766,20 @@ s_server_config_service (s_server_t *self)
                 zsys_notice ("server is using PLAIN security");
                 zsock_set_plain_server (self->router, 1);
             }
+#ifdef CZMQ_BUILD_DRAFT_API
+            else
+            if (streq (mechanism, "curve")) {
+                zsys_notice ("using CURVE security");
+                const char *keyfile = zconfig_get (section, "secret-key", NULL);
+                assert (keyfile);
+
+                zcert_t *server_cert = zcert_load(keyfile);
+                assert (server_cert);
+
+                zcert_apply (server_cert, self->router);
+                zsock_set_curve_server (self->router, 1);
+            }
+#endif
             else
                 zsys_warning ("mechanism=%s is not supported", mechanism);
         }
@@ -788,7 +807,7 @@ s_server_handle_pipe (zloop_t *loop, zsock_t *reader, void *argument)
     else
     if (streq (method, "$TERM")) {
         //  Shutdown the engine
-        free (method);
+        freen (method);
         zmsg_destroy (&msg);
         return -1;
     }
@@ -796,10 +815,31 @@ s_server_handle_pipe (zloop_t *loop, zsock_t *reader, void *argument)
     if (streq (method, "BIND")) {
         //  Bind to a specified endpoint, which may use an ephemeral port
         char *endpoint = zmsg_popstr (msg);
+
+#ifdef CZMQ_BUILD_DRAFT_API
+        if (self->server.secret_key) {
+            zcert_t *cert = zcert_new_from_txt(self->server.public_key, self->server.secret_key);
+            zcert_apply(cert, self->router);
+            zsock_set_curve_server (self->router, 1);
+
+            if (self->auth_zap_domain) {
+                zsys_info (self->auth_zap_domain);
+                zsock_set_zap_domain (self->router, self->auth_zap_domain);
+            }
+            zcert_destroy(&cert);
+        }
+#ifndef ZMQ_CURVE
+        // zmq legacy
+        bool ZMQ_CURVE = false;
+#endif
+        if (self->server.secret_key)
+            assert (zsock_mechanism (self->router) == ZMQ_CURVE);
+#endif
         self->port = zsock_bind (self->router, "%s", endpoint);
         if (self->port == -1)
             zsys_warning ("could not bind to %s", endpoint);
-        free (endpoint);
+
+        freen (endpoint);
     }
     else
     if (streq (method, "PORT")) {
@@ -820,7 +860,7 @@ s_server_handle_pipe (zloop_t *loop, zsock_t *reader, void *argument)
             zsys_warning ("cannot load config file '%s'", filename);
             self->config = zconfig_new ("root", NULL);
         }
-        free (filename);
+        freen (filename);
     }
     else
     if (streq (method, "SET")) {
@@ -829,26 +869,37 @@ s_server_handle_pipe (zloop_t *loop, zsock_t *reader, void *argument)
         zconfig_put (self->config, path, value);
         if (streq (path, "server/animate")) {
             zsys_warning ("'%s' is deprecated, use VERBOSE command instead", path);
-            self->verbose = atoi (value);
+            self->verbose = (atoi (value) == 1);
         }
         s_server_config_global (self);
-        free (path);
-        free (value);
+        freen (path);
+        freen (value);
     }
     else
     if (streq (method, "SAVE")) {
         char *filename = zmsg_popstr (msg);
         if (zconfig_save (self->config, filename))
             zsys_warning ("cannot save config file '%s'", filename);
-        free (filename);
+        freen (filename);
     }
+#ifdef CZMQ_BUILD_DRAFT_API
+    else
+    if (streq (method, "AUTH ZAP DOMAIN")) {
+        char *value = zmsg_popstr (msg);
+        self->auth_zap_domain = strdup(value);
+        assert (self->auth_zap_domain);
+        zstr_free (&value);
+
+        zsys_info ("auth zap domain: %s", self->auth_zap_domain);
+    }
+#endif
     else {
         //  Execute custom method
         zmsg_t *reply = server_method (&self->server, method, msg);
         //  If reply isn't null, send it to caller
         zmsg_send (&reply, self->pipe);
     }
-    free (method);
+    freen (method);
     zmsg_destroy (&msg);
     return 0;
 }
@@ -863,7 +914,7 @@ s_server_handle_protocol (zloop_t *loop, zsock_t *reader, void *argument)
     //  of polling and the reactor:
     while (zsock_events (self->router) & ZMQ_POLLIN) {
         if (zgossip_msg_recv (self->message, self->router))
-            return -1;              //  Interrupted; exit zloop
+            return -1;      //  Interrupted; exit zloop
 
         //  TODO: use binary hashing on routing_id
         char *hashkey = zframe_strhex (zgossip_msg_routing_id (self->message));
@@ -873,7 +924,7 @@ s_server_handle_protocol (zloop_t *loop, zsock_t *reader, void *argument)
             zhash_insert (self->clients, hashkey, client);
             zhash_freefn (self->clients, hashkey, s_client_free);
         }
-        free (hashkey);
+        freen (hashkey);
         //  Any input from client counts as activity
         if (client->ticket)
             zloop_ticket_reset (self->loop, client->ticket);

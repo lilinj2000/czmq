@@ -17,7 +17,8 @@
 //- Establish the compiler and computer system ------------------------------
 /*
  *  Defines zero or more of these symbols, for use in any non-portable
- *  code:
+ *  code (for pre-defined values see e.g. build-system headers as well
+ *  as output of GNU C preprocessor via `cpp -dM < /dev/null`):
  *
  *  __WINDOWS__         Microsoft C/C++ with Windows calls
  *  __MSDOS__           System is MS-DOS (set if __WINDOWS__ set)
@@ -39,6 +40,7 @@
  *  __UTYPE_HPUX        HP/UX
  *  __UTYPE_ANDROID     Android
  *  __UTYPE_LINUX       Linux
+ *  __UTYPE_GNU         GNU/Hurd
  *  __UTYPE_MIPS        MIPS (BSD 4.3/System V mixture)
  *  __UTYPE_NETBSD      NetBSD
  *  __UTYPE_NEXT        NeXT
@@ -79,6 +81,7 @@
 #   define __MSDOS__
 //  Stop cheeky warnings about "deprecated" functions like fopen
 #   if _MSC_VER >= 1500
+#       undef  _CRT_SECURE_NO_DEPRECATE
 #       define _CRT_SECURE_NO_DEPRECATE
 #       pragma warning(disable: 4996)
 #   endif
@@ -156,10 +159,13 @@
 #   ifndef _DEFAULT_SOURCE
 #   define _DEFAULT_SOURCE                  //  Include stuff from 4.3 BSD Unix
 #   endif
+#elif (defined (__GNU__))
+#   define __UTYPE_GNU
+#   define __UNIX__
 #elif (defined (Mips))
 #   define __UTYPE_MIPS
 #   define __UNIX__
-#elif (defined (FreeBSD) || defined (__FreeBSD__))
+#elif (defined (FreeBSD) || defined (__FreeBSD__) || defined (__FreeBSD_kernel__))
 #   define __UTYPE_FREEBSD
 #   define __UNIX__
 #elif (defined (NetBSD) || defined (__NetBSD__))
@@ -188,10 +194,12 @@
 #elif (defined (sinix))
 #   define __UTYPE_SINIX
 #   define __UNIX__
-#elif (defined (SOLARIS) || defined (__SRV4))
+#elif (defined (SOLARIS) || defined (__SVR4) || defined (SVR4) || defined (__SVR4__) || defined (__svr4) || defined (svr4) || defined (__svr4__))
+    // Note: this rule and below should match legacy SunOS and Solaris
+    // on builds without the GNU toolchain; with one you get __UTYPE_GNU
 #   define __UTYPE_SUNSOLARIS
 #   define __UNIX__
-#elif (defined (SUNOS) || defined (SUN) || defined (sun))
+#elif (defined (SUNOS) || defined (SUN) || defined (sun) || defined (__sun) || defined (__sun__))
 #   define __UTYPE_SUNOS
 #   define __UNIX__
 #elif (defined (__USLC__) || defined (UnixWare))
@@ -207,7 +215,9 @@
 //- Always include ZeroMQ headers -------------------------------------------
 
 #include "zmq.h"
-#include "zmq_utils.h"
+#if (ZMQ_VERSION < ZMQ_MAKE_VERSION (4, 2, 0))
+#   include "zmq_utils.h"
+#endif
 
 //- Standard ANSI include files ---------------------------------------------
 
@@ -230,9 +240,9 @@
 
 #if (defined (__MSDOS__))
 #   if (defined (__WINDOWS__))
-#       if (_WIN32_WINNT < 0x0501)
+#       if (_WIN32_WINNT < 0x0600)
 #           undef _WIN32_WINNT
-#           define _WIN32_WINNT 0x0501
+#           define _WIN32_WINNT 0x0600
 #       endif
 #       if (!defined (FD_SETSIZE))
 #           define FD_SETSIZE 1024      //  Max. filehandles/sockets
@@ -308,6 +318,9 @@
 #   endif
 #   if (defined (__UTYPE_ANDROID))
 #       include <android/log.h>
+#   endif
+#   if (defined (__UTYPE_LINUX) && defined (HAVE_LIBSYSTEMD))
+#       include <systemd/sd-daemon.h>
 #   endif
 #endif
 
@@ -391,20 +404,106 @@
 typedef unsigned char   byte;           //  Single unsigned byte = 8 bits
 typedef unsigned short  dbyte;          //  Double byte = 16 bits
 typedef unsigned int    qbyte;          //  Quad byte = 32 bits
-typedef struct sockaddr_in inaddr_t;    //  Internet socket address structure
+typedef struct sockaddr_in  inaddr_t;   //  Internet socket address structure
+typedef struct sockaddr_in6 in6addr_t;  //  Internet 6 socket address structure
+
+// Common structure to hold inaddr_t and in6addr_t with length
+typedef struct {
+    union {
+        inaddr_t __addr;          //  IPv4 address
+        in6addr_t __addr6;        //  IPv6 address
+    } __inaddr_u;
+#define ipv4addr   __inaddr_u.__addr
+#define ipv6addr   __inaddr_u.__addr6
+    int inaddrlen;
+} inaddr_storage_t;
 
 //- Inevitable macros -------------------------------------------------------
 
 #define streq(s1,s2)    (!strcmp ((s1), (s2)))
 #define strneq(s1,s2)   (strcmp ((s1), (s2)))
+#define freen(x) do {free(x); x = NULL;} while(0)
 
-//  Provide random number from 0..(num-1)
-#if (defined (__WINDOWS__)) || (defined (__UTYPE_IBMAIX)) \
- || (defined (__UTYPE_HPUX)) || (defined (__UTYPE_SUNOS))
-#   define randof(num)  (int) ((float) (num) * rand () / (RAND_MAX + 1.0))
-#else
-#   define randof(num)  (int) ((float) (num) * random () / (RAND_MAX + 1.0))
+//  randof(num) : Provide random number from 0..(num-1)
+//  ASSUMES that "num" itself is at most an int (bit size no more than float
+//  on the host platform), and non-negative; may be a "function()" token.
+//  For practical reasons, "num" should be under 50M or so.
+//  The math libraries on different platforms and capabilities in HW are a
+//  nightmare. Seems we have to drown the code in casts to have reasonable
+//  results... Also note that the 32-bit float has a hard time representing
+//  values close to UINT32_MAX that we had before, so now limit to UINT16_MAX.
+//  Platforms where RAND_MAX is comparable to even signed INT32_MAX were
+//  rigged with problems here: even if the code used double-precision, the
+//  corner-case factors (divident close to INT32_MAX and close to divisor)
+//  were too close to 1.0, so the final product was "num" rather than "num-1".
+//  Finally note that on some platforms RAND_MAX can be smallish, like 32767,
+//  so we should use it if small enough.
+
+//  Precision for our calculations impacts the MAX values we can use below
+//  Still, say UINT64_MAX is overkill. But smaller MAXes can yield better
+//  distribution of values with e.g. double.
+#if !defined (ZSYS_RANDOF_FLT)
+#   define  ZSYS_RANDOF_FLT float
+#endif // ZSYS_RANDOF_FLT is defined by caller... trust them or explode later
+
+// Implementations vary... Note that many will get __UTYPE_GNU nowadays.
+#if !defined (ZSYS_RANDOF_FUNC)
+# if defined (ZSYS_RANDOF_FUNC_BITS)
+#  undef ZSYS_RANDOF_FUNC_BITS
+# endif
+# if (defined (__WINDOWS__)) || (defined (__UTYPE_IBMAIX)) \
+ || (defined (__UTYPE_HPUX)) || (defined (__UTYPE_SUNOS)) || (defined (__UTYPE_SOLARIS))
+#   define  ZSYS_RANDOF_FUNC    rand
+#   define  ZSYS_RANDOF_FUNC_BITS 15
+# else
+#   define  ZSYS_RANDOF_FUNC    random
+#   define  ZSYS_RANDOF_FUNC_BITS 32
+# endif
+#endif // ZSYS_RANDOF_FUNC is defined by caller... trust them or explode later
+
+//  Limits below were experimented for 32-bit floats on x86 with test_randof
+//  Due to discrete rounding, greater values caused collisions with the
+//  fraction s_randof_factor() defined below returning 1.0.
+#if !defined (ZSYS_RANDOF_MAX)
+# if (ZSYS_RANDOF_FUNC_BITS >= 26)
+    // Assume that random() is at least 32-bit as it is on most platforms
+#       define  ZSYS_RANDOF_MAX (UINT32_MAX>>6)
+# else
+#  if defined (RAND_MAX)
+#   if (RAND_MAX > (UINT32_MAX>>6))
+#       define  ZSYS_RANDOF_MAX (UINT32_MAX>>6)
+#   else // RAND_MAX is small enough to not overflow our calculations
+#       define  ZSYS_RANDOF_MAX RAND_MAX
+#   endif
+#  else // No RAND_MAX - use a smaller safer limit, but with values too discrete
+#       define  ZSYS_RANDOF_MAX INT16_MAX
+#  endif
+# endif // not random()
+#endif // ZSYS_RANDOF_MAX is defined by caller... trust them or explode later
+
+#define s_randof_factor()   (ZSYS_RANDOF_FLT)( (ZSYS_RANDOF_FLT)(ZSYS_RANDOF_FUNC() % (ZSYS_RANDOF_MAX - 1)) / ( (ZSYS_RANDOF_FLT)(ZSYS_RANDOF_MAX) ) )
+
+// Supplement the limited spectrum of ZSYS_RANDOF_MAX by stacking more random()s
+// Note this can still be too little for very large "num" > ZSYS_RANDOF_MAX
+// but we'd need a real randof() function to handle stacking in that case.
+// Fuzziness added below (division by slightly more than a whole number) solves
+// this wonderfully even for "num" ranges twice as big as the ZSYS_RANDOF_MAX.
+#if (ZSYS_RANDOF_MAX > UINT16_MAX)
+#   define randof(num)  (int) ( (ZSYS_RANDOF_FLT)(num) * s_randof_factor() / ( 1.0 + s_randof_factor() / 100.0 ) )
+#else // boost dispersion
+# if (ZSYS_RANDOF_MAX > INT16_MAX)
+#   define randof(num)  (int) ( (ZSYS_RANDOF_FLT)(num) * ( s_randof_factor() + s_randof_factor() ) / ( 2.0 + s_randof_factor() / 2.0 ) )
+# else
+#  if (ZSYS_RANDOF_MAX > UINT8_MAX)
+#   define randof(num)  (int) ( (ZSYS_RANDOF_FLT)(num) * ( s_randof_factor() + s_randof_factor() + s_randof_factor() + s_randof_factor() ) / ( 4.0 + s_randof_factor() * 10.0 ) )
+#  else
+#   define randof(num)  (int) ( (ZSYS_RANDOF_FLT)(num) * ( s_randof_factor() + s_randof_factor() + s_randof_factor() + s_randof_factor() + s_randof_factor() + s_randof_factor() ) / ( 6.0 + s_randof_factor() * 100.0 ) )
+#  endif
+# endif
 #endif
+
+// That's it about the randof() macro definition...
+
 
 // Windows MSVS doesn't have stdbool
 #if (defined (_MSC_VER))
@@ -438,11 +537,10 @@ typedef struct sockaddr_in inaddr_t;    //  Internet socket address structure
     typedef unsigned int  uint;
 #   if (!defined (__MINGW32__))
     typedef int mode_t;
-#       if defined (__IS_64BIT__)
-    typedef long long ssize_t;
-#       else
-    typedef long ssize_t;
-#       endif
+#     if !defined (_SSIZE_T_DEFINED)
+typedef intptr_t ssize_t;
+#       define _SSIZE_T_DEFINED
+#     endif
 #   endif
 #   if ((!defined (__MINGW32__) \
     || (defined (__MINGW32__) && defined (__IS_64BIT__))) \
@@ -468,6 +566,18 @@ typedef struct sockaddr_in inaddr_t;    //  Internet socket address structure
 #   endif
 #   if (!defined (PRId64))
 #       define PRId64   "I64d"
+#   endif
+#   if (!defined (PRIi8))
+#       define PRIi8    "i"
+#   endif
+#   if (!defined (PRIi16))
+#       define PRIi16   "i"
+#   endif
+#   if (!defined (PRIi32))
+#       define PRIi32   "i"
+#   endif
+#   if (!defined (PRIi64))
+#       define PRIi64   "I64i"
 #   endif
 #   if (!defined (PRIu8))
 #       define PRIu8    "u"
@@ -497,30 +607,11 @@ typedef struct sockaddr_in inaddr_t;    //  Internet socket address structure
 
 //- Non-portable declaration specifiers -------------------------------------
 
-#if defined (__WINDOWS__)
-#   if defined LIBCZMQ_STATIC
-#       define CZMQ_EXPORT
-#   elif defined LIBCZMQ_EXPORTS
-#       define CZMQ_EXPORT __declspec(dllexport)
-#   else
-#       define CZMQ_EXPORT __declspec(dllimport)
-#   endif
-#else
-#   define CZMQ_EXPORT
-#endif
-
 //  For thread-local storage
 #if defined (__WINDOWS__)
 #   define CZMQ_THREADLS __declspec(thread)
 #else
 #   define CZMQ_THREADLS __thread
-#endif
-
-//- Memory allocations ------------------------------------------------------
-#if defined(__cplusplus)
-   extern "C" CZMQ_EXPORT volatile uint64_t zsys_allocs;
-#else
-   extern CZMQ_EXPORT volatile uint64_t zsys_allocs;
 #endif
 
 //  Replacement for malloc() which asserts if we run out of heap, and
@@ -529,10 +620,6 @@ static inline void *
 safe_malloc (size_t size, const char *file, unsigned line)
 {
 //     printf ("%s:%u %08d\n", file, line, (int) size);
-#if defined (__UTYPE_LINUX) && defined (__IS_64BIT__)
-    //  On GCC we count zmalloc memory allocations
-    __sync_add_and_fetch (&zsys_allocs, 1);
-#endif
     void *mem = calloc (1, size);
     if (mem == NULL) {
         fprintf (stderr, "FATAL ERROR at %s:%u\n", file, line);
@@ -548,7 +635,7 @@ safe_malloc (size_t size, const char *file, unsigned line)
 //  results, compile all classes so you see dangling object allocations.
 //  _ZMALLOC_PEDANTIC does the same thing, but its intention is to propagate
 //  out of memory condition back up the call stack.
-#if defined _ZMALLOC_DEBUG || _ZMALLOC_PEDANTIC
+#if defined (_ZMALLOC_DEBUG) || defined (_ZMALLOC_PEDANTIC)
 #   define zmalloc(size) calloc(1,(size))
 #else
 #   define zmalloc(size) safe_malloc((size), __FILE__, __LINE__)
@@ -574,6 +661,11 @@ typedef int SOCKET;
 
 #if defined (HAVE_LINUX_WIRELESS_H)
 #   include <linux/wireless.h>
+//  This would normally come from net/if.h
+unsigned int if_nametoindex (const char *ifname);
+char *if_indextoname (unsigned int ifindex, char *ifname);
+//  32 on Linux, 256 on Windows, pick largest to avoid overflows
+#   define IF_NAMESIZE 256
 #else
 #   if defined (HAVE_NET_IF_H)
 #       include <net/if.h>

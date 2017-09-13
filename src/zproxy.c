@@ -1,4 +1,4 @@
-﻿/*  =========================================================================
+/*  =========================================================================
     zproxy - run a steerable proxy in the background
 
     Copyright (c) the Contributors as noted in the AUTHORS file.
@@ -22,7 +22,7 @@
 @end
 */
 
-#include "../include/czmq.h"
+#include "czmq_classes.h"
 
 typedef enum proxy_socket {
     NONE = -1,
@@ -53,37 +53,37 @@ typedef struct {
     bool verbose;               //  Verbose logging enabled?
 } self_t;
 
+
+static self_t *
+s_self_new (zsock_t *pipe)
+{
+    self_t *self = (self_t *) zmalloc (sizeof (self_t));
+    assert (self);
+    self->pipe = pipe;
+    self->poller = zpoller_new (self->pipe, NULL);
+    assert (self->poller);
+    return self;
+}
+
 static void
 s_self_destroy (self_t **self_p)
 {
     assert (self_p);
     if (*self_p) {
         self_t *self = *self_p;
+        zpoller_destroy (&self->poller);
         zsock_destroy (&self->frontend);
         zsock_destroy (&self->backend);
         zsock_destroy (&self->capture);
-        for (int index = 0; index < SOCKETS; index++) {
+        int index;
+        for (index = 0; index < SOCKETS; index++) {
             zstr_free (&self->domain [index]);
             zstr_free (&self->public_key [index]);
             zstr_free (&self->secret_key [index]);
         }
-        zpoller_destroy (&self->poller);
-        free (self);
+        freen (self);
         *self_p = NULL;
     }
-}
-
-static self_t *
-s_self_new (zsock_t *pipe)
-{
-    self_t *self = (self_t *) zmalloc (sizeof (self_t));
-    if (self) {
-        self->pipe = pipe;
-        self->poller = zpoller_new (self->pipe, NULL);
-        if (!self->poller)
-            s_self_destroy (&self);
-    }
-    return self;
 }
 
 static zsock_t *
@@ -118,9 +118,9 @@ s_self_create_socket (self_t *self, char *type_name, char *endpoints, proxy_sock
         if (self->auth_type [selected_socket] == AUTH_CURVE) {
             // Apply certificate keys
             char *public_key = self->public_key [selected_socket];
-            assert(public_key);
+            assert (public_key);
             char *secret_key = self->secret_key [selected_socket];
-            assert(secret_key);
+            assert (secret_key);
             zsock_set_curve_publickey (sock, public_key);
             zsock_set_curve_secretkey (sock, secret_key);
 
@@ -179,9 +179,10 @@ s_self_selected_socket (zmsg_t *request)
         zsys_error ("zproxy: invalid proxy socket selection: %s", socket_name);
         assert (false);
     }
-
+    zstr_free (&socket_name);
     return socket;
 }
+
 
 static void
 s_self_configure (self_t *self, zsock_t **sock_p, zmsg_t *request, proxy_socket selected_socket)
@@ -197,9 +198,17 @@ s_self_configure (self_t *self, zsock_t **sock_p, zmsg_t *request, proxy_socket 
     assert (*sock_p == NULL);
     *sock_p = s_self_create_socket (self, type_name, endpoints, selected_socket);
     assert (*sock_p);
-    zpoller_add (self->poller, *sock_p);
     zstr_free (&type_name);
     zstr_free (&endpoints);
+}
+
+static void
+s_self_add_to_poller_when_configured (self_t *self)
+{
+    if (self->frontend && self->backend) {
+        zpoller_add(self->poller, self->frontend);
+        zpoller_add(self->poller, self->backend);
+    }
 }
 
 //  --------------------------------------------------------------------------
@@ -220,11 +229,13 @@ s_self_handle_pipe (self_t *self)
 
     if (streq (command, "FRONTEND")) {
         s_self_configure (self, &self->frontend, request, FRONTEND);
+        s_self_add_to_poller_when_configured (self);
         zsock_signal (self->pipe, 0);
     }
     else
     if (streq (command, "BACKEND")) {
         s_self_configure (self, &self->backend, request, BACKEND);
+        s_self_add_to_poller_when_configured (self);
         zsock_signal (self->pipe, 0);
     }
     else
@@ -298,6 +309,7 @@ s_self_handle_pipe (self_t *self)
     return 0;
 }
 
+
 //  --------------------------------------------------------------------------
 //  Switch messages from an input socket to an output socket until there are
 //  no messages left waiting. We use this loop rather than zmq_poll, to reduce
@@ -331,6 +343,7 @@ s_self_switch (self_t *self, zsock_t *input, zsock_t *output)
     }
 }
 
+
 //  --------------------------------------------------------------------------
 //  zproxy() implements the zproxy actor interface
 
@@ -359,6 +372,7 @@ zproxy (zsock_t *pipe, void *unused)
     s_self_destroy (&self);
 }
 
+
 //  --------------------------------------------------------------------------
 //  Selftest
 
@@ -385,7 +399,7 @@ s_create_test_sockets (zactor_t **proxy, zsock_t **faucet, zsock_t **sink, bool 
 }
 
 static int
-s_get_available_port ()
+s_get_available_port (void)
 {
     int port_nbr = -1;
     int attempts = 0;
@@ -399,18 +413,17 @@ s_get_available_port ()
         port_nbr = zsock_bind (server, LOCALENDPOINT, port_nbr);
         zsock_destroy (&server);
     }
-
     if (port_nbr < 0) {
         zsys_error ("zproxy: failed to find an available port number");
         assert (false);
     }
-
     return port_nbr;
 }
 
 //  Checks whether client can connect to server
+//  expect_success is used to synchronise the connect as sleeps are unreliable
 static bool
-s_can_connect (zactor_t **proxy, zsock_t **faucet, zsock_t **sink, const char *frontend, const char *backend, bool verbose)
+s_can_connect (zactor_t **proxy, zsock_t **faucet, zsock_t **sink, const char *frontend, const char *backend, bool verbose, bool expect_success)
 {
     assert (*faucet);
     assert (*sink);
@@ -421,10 +434,22 @@ s_can_connect (zactor_t **proxy, zsock_t **faucet, zsock_t **sink, const char *f
     assert (rc == 0);
     rc = zsock_connect (*sink, "%s", backend);
     assert (rc == 0);
-    zstr_send (*faucet, "Hello, World");
+    if (expect_success) {
+        zstr_send (*faucet, "Hello, World");
+        char *hello = zstr_recv (*sink);
+        assert (hello);
+        assert (streq (hello, "Hello, World"));
+        zstr_free (&hello);
+    }
+    zframe_t *frame = zframe_from ("Hello, World");
+    rc = zframe_send (&frame, *faucet, expect_success ? 0 : ZFRAME_DONTWAIT);
+    assert (rc == 0 || !expect_success);
+    if (!expect_success && rc == -1)
+        zframe_destroy (&frame);
+
     zpoller_t *poller = zpoller_new (*sink, NULL);
     assert (poller);
-    bool success = (zpoller_wait (poller, 200) == *sink);
+    bool success = (zpoller_wait (poller, 400) == *sink);
     zpoller_destroy (&poller);
     s_create_test_sockets (proxy, faucet, sink, verbose);
 
@@ -438,7 +463,7 @@ s_bind_test_sockets (zactor_t *proxy, char **frontend, char **backend)
     zstr_free (backend);
     assert (proxy);
 
-    srandom (time (NULL) ^ *(int *) proxy);
+    srandom ((uint) (time (NULL) ^ *(int *) proxy));
     *frontend = zsys_sprintf (LOCALENDPOINT, s_get_available_port ());
     *backend = zsys_sprintf (LOCALENDPOINT, s_get_available_port ());
 
@@ -459,6 +484,36 @@ zproxy_test (bool verbose)
         printf ("\n");
 
     //  @selftest
+
+    // Note: If your selftest reads SCMed fixture data, please keep it in
+    // src/selftest-ro; if your test creates filesystem objects, please
+    // do so under src/selftest-rw. They are defined below along with a
+    // usecase for the variables (assert) to make compilers happy.
+    const char *SELFTEST_DIR_RO = "src/selftest-ro";
+    const char *SELFTEST_DIR_RW = "src/selftest-rw";
+    assert (SELFTEST_DIR_RO);
+    assert (SELFTEST_DIR_RW);
+    // Uncomment these to use C++ strings in C++ selftest code:
+    //std::string str_SELFTEST_DIR_RO = std::string(SELFTEST_DIR_RO);
+    //std::string str_SELFTEST_DIR_RW = std::string(SELFTEST_DIR_RW);
+    //assert ( (str_SELFTEST_DIR_RO != "") );
+    //assert ( (str_SELFTEST_DIR_RW != "") );
+    // NOTE that for "char*" context you need (str_SELFTEST_DIR_RO + "/myfilename").c_str()
+
+    const char *testbasedir  = ".test_zproxy";
+    const char *testpassfile = "password-file";
+    const char *testcertfile = "mycert.txt";
+    char *basedirpath = NULL;   // subdir in a test, under SELFTEST_DIR_RW
+    char *passfilepath = NULL;  // pathname to testfile in a test, in dirpath
+    char *certfilepath = NULL;  // pathname to testfile in a test, in dirpath
+
+    basedirpath = zsys_sprintf ("%s/%s", SELFTEST_DIR_RW, testbasedir);
+    assert (basedirpath);
+    passfilepath = zsys_sprintf ("%s/%s", basedirpath, testpassfile);
+    assert (passfilepath);
+    certfilepath = zsys_sprintf ("%s/%s", basedirpath, testcertfile);
+    assert (certfilepath);
+
     //  Create and configure our proxy
     zactor_t *proxy = zactor_new (zproxy, NULL);
     assert (proxy);
@@ -527,12 +582,42 @@ zproxy_test (bool verbose)
     zsock_destroy (&capture);
     zactor_destroy (&proxy);
 
+    //  Test socket creation dependency
+    proxy = zactor_new (zproxy, NULL);
+    assert (proxy);
+
+#ifdef  WIN32
+	sink = zsock_new_sub(">inproc://backend", "whatever");
+#else
+	sink = zsock_new_sub (">ipc://backend", "whatever");
+#endif //  WIN32
+	assert (sink);
+
+#ifdef WIN32
+	zstr_sendx (proxy, "BACKEND", "XPUB", "inproc://backend", NULL);
+#else
+	zstr_sendx(proxy, "BACKEND", "XPUB", "ipc://backend", NULL);
+#endif
+    zsock_wait (proxy);
+
+    zsock_destroy(&sink);
+    zactor_destroy(&proxy);
+
 #if (ZMQ_VERSION_MAJOR == 4)
     // Test authentication functionality
-#   define TESTDIR ".test_zproxy"
+
+    // Make sure old aborted tests do not hinder us
+    zdir_t *dir = zdir_new (basedirpath, NULL);
+    if (dir) {
+        zdir_remove (dir, true);
+        zdir_destroy (&dir);
+    }
+    zsys_file_delete (passfilepath);
+    zsys_file_delete (certfilepath);
+    zsys_dir_delete (basedirpath);
 
     //  Create temporary directory for test files
-    zsys_dir_create (TESTDIR);
+    zsys_dir_create (basedirpath);
 
     char *frontend = NULL;
     char *backend = NULL;
@@ -540,7 +625,8 @@ zproxy_test (bool verbose)
     //  Check there's no authentication
     s_create_test_sockets (&proxy, &faucet, &sink, verbose);
     s_bind_test_sockets (proxy, &frontend, &backend);
-    bool success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    bool success = s_can_connect (&proxy, &faucet, &sink, frontend, backend,
+        verbose, true);
     assert (success);
 
     //  Install the authenticator
@@ -553,7 +639,8 @@ zproxy_test (bool verbose)
 
     //  Check there's no authentication on a default NULL server
     s_bind_test_sockets (proxy, &frontend, &backend);
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        true);
     assert (success);
 
     //  When we set a domain on the server, we switch on authentication
@@ -562,7 +649,8 @@ zproxy_test (bool verbose)
     zstr_sendx (proxy, "DOMAIN", "FRONTEND", "global", NULL);
     zsock_wait (proxy);
     s_bind_test_sockets (proxy, &frontend, &backend);
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        true);
     assert (success);
 
     //  Blacklist 127.0.0.1, connection should fail
@@ -571,7 +659,8 @@ zproxy_test (bool verbose)
     s_bind_test_sockets (proxy, &frontend, &backend);
     zstr_sendx (auth, "DENY", "127.0.0.1", NULL);
     zsock_wait (auth);
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        false);
     assert (!success);
 
     //  Whitelist our address, which overrides the blacklist
@@ -582,7 +671,8 @@ zproxy_test (bool verbose)
     s_bind_test_sockets (proxy, &frontend, &backend);
     zstr_sendx (auth, "ALLOW", "127.0.0.1", NULL);
     zsock_wait (auth);
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        true);
     assert (success);
 
     //  Try PLAIN authentication
@@ -593,11 +683,12 @@ zproxy_test (bool verbose)
     s_bind_test_sockets (proxy, &frontend, &backend);
     zsock_set_plain_username (faucet, "admin");
     zsock_set_plain_password (faucet, "Password");
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        false);
     assert (!success);
 
     //  Test positive case (server-side passwords defined)
-    FILE *password = fopen (TESTDIR "/password-file", "w");
+    FILE *password = fopen (passfilepath, "w");
     assert (password);
     fprintf (password, "admin=Password\n");
     fclose (password);
@@ -610,9 +701,10 @@ zproxy_test (bool verbose)
     zsock_set_plain_password (faucet, "Password");
     zsock_set_plain_username (sink, "admin");
     zsock_set_plain_password (sink, "Password");
-    zstr_sendx (auth, "PLAIN", TESTDIR "/password-file", NULL);
+    zstr_sendx (auth, "PLAIN", passfilepath, NULL);
     zsock_wait (auth);
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        true);
     assert (success);
 
     //  Test negative case (bad client password)
@@ -621,7 +713,8 @@ zproxy_test (bool verbose)
     s_bind_test_sockets (proxy, &frontend, &backend);
     zsock_set_plain_username (faucet, "admin");
     zsock_set_plain_password (faucet, "Bogus");
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        false);
     assert (!success);
 
     if (zsys_has_curve ()) {
@@ -631,8 +724,8 @@ zproxy_test (bool verbose)
         assert (server_cert);
         zcert_t *client_cert = zcert_new ();
         assert (client_cert);
-        char *public_key = zcert_public_txt (server_cert);
-        char *secret_key = zcert_secret_txt (server_cert);
+        const char *public_key = zcert_public_txt (server_cert);
+        const char *secret_key = zcert_secret_txt (server_cert);
 
         //  Try CURVE authentication
 
@@ -642,7 +735,8 @@ zproxy_test (bool verbose)
         s_bind_test_sockets (proxy, &frontend, &backend);
         zcert_apply (client_cert, faucet);
         zsock_set_curve_serverkey (faucet, public_key);
-        success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+        success = s_can_connect (&proxy, &faucet, &sink, frontend, backend,
+            verbose, false);
         assert (!success);
 
         //  Test CURVE_ALLOW_ANY
@@ -653,7 +747,8 @@ zproxy_test (bool verbose)
         zsock_set_curve_serverkey (faucet, public_key);
         zstr_sendx (auth, "CURVE", CURVE_ALLOW_ANY, NULL);
         zsock_wait (auth);
-        success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+        success = s_can_connect (&proxy, &faucet, &sink, frontend, backend,
+            verbose, true);
         assert (success);
 
         //  Test with client certificate file in authentication folder
@@ -666,10 +761,11 @@ zproxy_test (bool verbose)
         zsock_set_curve_serverkey (faucet, public_key);
         zcert_apply (client_cert, sink);
         zsock_set_curve_serverkey (sink, public_key);
-        zcert_save_public (client_cert, TESTDIR "/mycert.txt");
-        zstr_sendx (auth, "CURVE", TESTDIR, NULL);
+        zcert_save_public (client_cert, certfilepath);
+        zstr_sendx (auth, "CURVE", basedirpath, NULL);
         zsock_wait (auth);
-        success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+        success = s_can_connect (&proxy, &faucet, &sink, frontend, backend,
+            verbose, true);
         assert (success);
 
         zcert_destroy (&server_cert);
@@ -679,14 +775,29 @@ zproxy_test (bool verbose)
     //  Remove the authenticator and check a normal connection works
     zactor_destroy (&auth);
     s_bind_test_sockets (proxy, &frontend, &backend);
-    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose);
+    success = s_can_connect (&proxy, &faucet, &sink, frontend, backend, verbose,
+        true);
     assert (success);
 
+    //  Cleanup
     zsock_destroy (&faucet);
     zsock_destroy (&sink);
     zactor_destroy (&proxy);
     zstr_free (&frontend);
     zstr_free (&backend);
+
+    //  Delete temporary directory and test files
+    zsys_file_delete (passfilepath);
+    zsys_file_delete (certfilepath);
+    zsys_dir_delete (basedirpath);
+#endif
+
+    zstr_free (&passfilepath);
+    zstr_free (&certfilepath);
+    zstr_free (&basedirpath);
+
+#if defined (__WINDOWS__)
+    zsys_shutdown();
 #endif
     //  @end
     printf ("OK\n");

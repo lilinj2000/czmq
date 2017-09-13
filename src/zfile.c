@@ -29,7 +29,7 @@
 @end
 */
 
-#include "../include/czmq.h"
+#include "czmq_classes.h"
 
 //  Structure of our class
 
@@ -64,51 +64,42 @@ zfile_t *
 zfile_new (const char *path, const char *name)
 {
     zfile_t *self = (zfile_t *) zmalloc (sizeof (zfile_t));
+    assert (self);
 
-    if (self) {
-        //  Format full path to file
-        if (path) {
-            self->fullname = (char *) zmalloc (strlen (path) + strlen (name) + 2);
-            if (self->fullname)
-                sprintf (self->fullname, "%s/%s", path, name);
-            else {
-                zfile_destroy (&self);
-                return NULL;
-            }
-        }
-        else
-            self->fullname = strdup (name);
+    //  Format full path to file
+    if (path) {
+        self->fullname = (char *) zmalloc (strlen (path) + strlen (name) + 2);
+        assert (self->fullname);
+        sprintf (self->fullname, "%s/%s", path, name);
+    }
+    else
+        self->fullname = strdup (name);
 
-        if (self->fullname) {
-            //  Resolve symbolic link if possible
-            if (strlen (self->fullname) > 3
-            &&  streq (self->fullname + strlen (self->fullname) - 3, ".ln")) {
-                FILE *handle = fopen (self->fullname, "r");
-                if (handle) {
-                    char buffer [256];
-                    if (fgets (buffer, 256, handle)) {
-                        //  We have the contents of the symbolic link
-                        if (buffer [strlen (buffer) - 1] == '\n')
-                            buffer [strlen (buffer) - 1] = 0;
-                        self->link = strdup (buffer);
-                        
-                        //  Chop ".ln" off name for external use
-                        if (self->link)
-                            self->fullname [strlen (self->fullname) - 3] = 0;
-                        else {
-                            fclose (handle);
-                            zfile_destroy (&self);
-                            return NULL;
-                        }
-                    }
+    //  Resolve symbolic link if possible
+    if (strlen (self->fullname) > 3
+    &&  streq (self->fullname + strlen (self->fullname) - 3, ".ln")) {
+        FILE *handle = fopen (self->fullname, "r");
+        if (handle) {
+            char buffer [256];
+            if (fgets (buffer, 256, handle)) {
+                //  We have the contents of the symbolic link
+                if (buffer [strlen (buffer) - 1] == '\n')
+                    buffer [strlen (buffer) - 1] = 0;
+                self->link = strdup (buffer);
+
+                //  Chop ".ln" off name for external use
+                if (self->link)
+                    self->fullname [strlen (self->fullname) - 3] = 0;
+                else {
                     fclose (handle);
+                    zfile_destroy (&self);
+                    return NULL;
                 }
             }
-            zfile_restat (self);
+            fclose (handle);
         }
-        else
-            zfile_destroy (&self);
     }
+    zfile_restat (self);
     return self;
 }
 
@@ -125,10 +116,10 @@ zfile_destroy (zfile_t **self_p)
         zdigest_destroy (&self->digest);
         if (self->handle)
             fclose (self->handle);
-        free (self->fullname);
-        free (self->curline);
-        free (self->link);
-        free (self);
+        freen (self->fullname);
+        freen (self->curline);
+        freen (self->link);
+        freen (self);
         *self_p = NULL;
     }
 }
@@ -143,16 +134,13 @@ zfile_dup (zfile_t *self)
 {
     if (self) {
         zfile_t *copy = (zfile_t *) zmalloc (sizeof (zfile_t));
-        if (copy)
-            copy->fullname = strdup (self->fullname);
-        if (copy->fullname) {
-            copy->modified = self->modified;
-            copy->cursize = self->cursize;
-            copy->link = self->link? strdup (self->link): NULL;
-            copy->mode = self->mode;
-        }
-        else
-            zfile_destroy (&copy);
+        assert (copy);
+        copy->fullname = strdup (self->fullname);
+        assert (copy->fullname);
+        copy->modified = self->modified;
+        copy->cursize = self->cursize;
+        copy->link = self->link? strdup (self->link): NULL;
+        copy->mode = self->mode;
         return copy;
     }
     else
@@ -172,7 +160,7 @@ zfile_filename (zfile_t *self, const char *path)
     &&  strlen (self->fullname) >= strlen (path)
     &&  memcmp (self->fullname, path, strlen (path)) == 0) {
         name += strlen (path);
-        if (*name == '/')
+        while (*name == '/')
             name++;
     }
     return name;
@@ -374,22 +362,22 @@ zfile_output (zfile_t *self)
 
     //  Wipe symbolic link if that's what the file was
     if (self->link) {
-        free (self->link);
+        freen (self->link);
         self->link = NULL;
     }
     rc = zsys_dir_create (file_path);
-    free (file_path);
+    freen (file_path);
     if (rc != 0)
         return -1;
 
     //  Create file if it doesn't exist
     if (self->handle)
         zfile_close (self);
-    
+
     self->handle = fopen (self->fullname, "r+b");
     if (!self->handle)
         self->handle = fopen (self->fullname, "w+b");
-    
+
     return self->handle? 0: -1;
 }
 
@@ -403,22 +391,26 @@ zfile_read (zfile_t *self, size_t bytes, off_t offset)
 {
     assert (self);
     assert (self->handle);
-    
-    //  Calculate real number of bytes to read
-    if (offset > self->cursize)
-        bytes = 0;
-    else
-    if (bytes > (size_t) (self->cursize - offset))
-        bytes = (size_t) (self->cursize - offset);
-
-    if (fseek (self->handle, (long) offset, SEEK_SET) == -1)
-        return NULL;
 
     self->eof = false;
-    zchunk_t *chunk = zchunk_read (self->handle, bytes);
-    if (chunk)
-        self->eof = zchunk_size (chunk) < bytes;
-    return chunk;
+    //  Calculate real number of bytes to read
+    if (offset > self->cursize) {
+        // if we tried to read 'after' the cursise, then we are at the end
+        bytes = 0;
+        self->eof = true;
+    }
+    else
+    if (bytes > (size_t) (self->cursize - offset)) {
+        // if we are trying to read more than there is, we are at the end
+        self->eof = true;
+        bytes = (size_t) (self->cursize - offset);
+    }
+
+    if (fseek (self->handle, (long) offset, SEEK_SET) == -1) {
+        return NULL;
+    }
+
+    return zchunk_read (self->handle, bytes);
 }
 
 
@@ -464,6 +456,7 @@ zfile_readln (zfile_t *self)
     if (!self->curline) {
         self->linemax = 512; 
         self->curline = (char *) malloc (self->linemax);
+        assert (self->curline);
     }
     uint char_nbr = 0;
     while (true) {
@@ -527,7 +520,7 @@ zfile_digest (zfile_t *self)
             return NULL;            //  Problem reading file
 
         //  Now calculate hash for file data, chunk by chunk
-        size_t blocksz = 65535;
+        long blocksz = 65535;
         off_t offset = 0;
 
         self->digest = zdigest_new ();
@@ -544,8 +537,8 @@ zfile_digest (zfile_t *self)
             if (blocksz > LONG_MAX - offset)
                 return NULL;
 
-            offset += (off_t) blocksz;
-            chunk = zfile_read (self, blocksz, offset);
+            offset += blocksz;
+            chunk = zfile_read (self, (size_t) blocksz, offset);
         }
         zchunk_destroy (&chunk);
         fclose (self->handle);
@@ -616,14 +609,68 @@ zfile_test (bool verbose)
     printf (" * zfile: ");
 
     //  @selftest
-    zfile_t *file = zfile_new (NULL, "bilbo");
+
+    // Note: If your selftest reads SCMed fixture data, please keep it in
+    // src/selftest-ro; if your test creates filesystem objects, please
+    // do so under src/selftest-rw. They are defined below along with a
+    // usecase for the variables (assert) to make compilers happy.
+    const char *SELFTEST_DIR_RO = "src/selftest-ro";
+    const char *SELFTEST_DIR_RW = "src/selftest-rw";
+    assert (SELFTEST_DIR_RO);
+    assert (SELFTEST_DIR_RW);
+    // Uncomment these to use C++ strings in C++ selftest code:
+    //std::string str_SELFTEST_DIR_RO = std::string(SELFTEST_DIR_RO);
+    //std::string str_SELFTEST_DIR_RW = std::string(SELFTEST_DIR_RW);
+    //assert ( (str_SELFTEST_DIR_RO != "") );
+    //assert ( (str_SELFTEST_DIR_RW != "") );
+    // NOTE that for "char*" context you need (str_SELFTEST_DIR_RO + "/myfilename").c_str()
+
+    const char *testbasedir  = "this";
+    const char *testsubdir  = "is/a/test";
+    const char *testfile = "bilbo";
+    const char *testlink = "bilbo.ln";
+    char *basedirpath = NULL;   // subdir in a test, under SELFTEST_DIR_RW
+    char *dirpath = NULL;       // subdir in a test, under basedirpath
+    char *filepath = NULL;      // pathname to testfile in a test, in dirpath
+    char *linkpath = NULL;      // pathname to testlink in a test, in dirpath
+
+    basedirpath = zsys_sprintf ("%s/%s", SELFTEST_DIR_RW, testbasedir);
+    assert (basedirpath);
+    dirpath = zsys_sprintf ("%s/%s", basedirpath, testsubdir);
+    assert (dirpath);
+    filepath = zsys_sprintf ("%s/%s", dirpath, testfile);
+    assert (filepath);
+    linkpath = zsys_sprintf ("%s/%s", dirpath, testlink);
+    assert (linkpath);
+
+    // This subtest is specifically for NULL as current directory, so
+    // no SELFTEST_DIR_RW here; testfile should have no slashes inside.
+    // Normally tests clean up in zfile_destroy(), but if a selftest run
+    // dies e.g. on assert(), workspace remains dirty. Better clean it up.
+    if (zfile_exists (testfile) ) {
+        if (verbose)
+            zsys_debug ("zfile_test() has to remove ./%s that should not have been here", testfile);
+        zfile_delete (testfile);
+    }
+    zfile_t *file = zfile_new (NULL, testfile);
     assert (file);
-    assert (streq (zfile_filename (file, "."), "bilbo"));
+    assert (streq (zfile_filename (file, "."), testfile));
     assert (zfile_is_readable (file) == false);
     zfile_destroy (&file);
 
     //  Create a test file in some random subdirectory
-    file = zfile_new ("./this/is/a/test", "bilbo");
+    if (verbose)
+        zsys_debug ("zfile_test() at timestamp %" PRIi64 ": "
+            "Creating new zfile %s",
+            zclock_time(), filepath );
+
+    if (zfile_exists (filepath) ) {
+        if (verbose)
+            zsys_debug ("zfile_test() has to remove %s that should not have been here", filepath);
+        zfile_delete (filepath);
+    }
+
+    file = zfile_new (dirpath, testfile);
     assert (file);
     int rc = zfile_output (file);
     assert (rc == 0);
@@ -632,23 +679,43 @@ zfile_test (bool verbose)
     zchunk_fill (chunk, 0, 100);
 
     //  Write 100 bytes at position 1,000,000 in the file
+    if (verbose)
+        zsys_debug ("zfile_test() at timestamp %" PRIi64 ": "
+            "Writing 100 bytes at position 1,000,000 in the file",
+            zclock_time() );
     rc = zfile_write (file, chunk, 1000000);
+    if (verbose)
+        zsys_debug ("zfile_test() at timestamp %" PRIi64 ": "
+            "Wrote 100 bytes at position 1,000,000 in the file, result code %d",
+            zclock_time(), rc );
     assert (rc == 0);
     zchunk_destroy (&chunk);
     zfile_close (file);
     assert (zfile_is_readable (file));
     assert (zfile_cursize (file) == 1000100);
+    if (verbose)
+        zsys_debug ("zfile_test() at timestamp %" PRIi64 ": "
+            "Testing if file is NOT stable (is younger than 1 sec)",
+            zclock_time() );
     assert (!zfile_is_stable (file));
+    if (verbose)
+        zsys_debug ("zfile_test() at timestamp %" PRIi64 ": "
+            "Passed the lag-dependent tests",
+            zclock_time() );
     assert (zfile_digest (file));
 
     //  Now truncate file from outside
-    int handle = open ("./this/is/a/test/bilbo", O_WRONLY | O_TRUNC | O_BINARY, 0);
+    int handle = open (filepath, O_WRONLY | O_TRUNC | O_BINARY, 0);
     assert (handle >= 0);
     rc = write (handle, "Hello, World\n", 13);
     assert (rc == 13);
     close (handle);
     assert (zfile_has_changed (file));
-    zclock_sleep (1001);
+#ifdef CZMQ_BUILD_DRAFT_API
+    zclock_sleep ((int)zsys_file_stable_age_msec() + 50);
+#else
+    zclock_sleep (5050);
+#endif
     assert (zfile_has_changed (file));
 
     assert (!zfile_is_stable (file));
@@ -675,14 +742,14 @@ zfile_test (bool verbose)
     zfile_close (file);
 
     //  Try some fun with symbolic links
-    zfile_t *link = zfile_new ("./this/is/a/test", "bilbo.ln");
+    zfile_t *link = zfile_new (dirpath, testlink);
     assert (link);
     rc = zfile_output (link);
     assert (rc == 0);
-    fprintf (zfile_handle (link), "./this/is/a/test/bilbo\n");
+    fprintf (zfile_handle (link), "%s\n", filepath);
     zfile_destroy (&link);
 
-    link = zfile_new ("./this/is/a/test", "bilbo.ln");
+    link = zfile_new (dirpath, testlink);
     assert (link);
     rc = zfile_input (link);
     assert (rc == 0);
@@ -693,7 +760,7 @@ zfile_test (bool verbose)
     zfile_destroy (&link);
 
     //  Remove file and directory
-    zdir_t *dir = zdir_new ("./this", NULL);
+    zdir_t *dir = zdir_new (basedirpath, NULL);
     assert (dir);
     assert (zdir_cursize (dir) == 26);
     zdir_remove (dir, true);
@@ -707,6 +774,67 @@ zfile_test (bool verbose)
     rc = zfile_input (file);
     assert (rc == -1);
     zfile_destroy (&file);
+
+    // This set of tests is done, free the strings for reuse
+    zstr_free (&basedirpath);
+    zstr_free (&dirpath);
+    zstr_free (&filepath);
+    zstr_free (&linkpath);
+
+    const char *eof_checkfile = "eof_checkfile";
+    filepath = zsys_sprintf ("%s/%s", SELFTEST_DIR_RW, eof_checkfile);
+    assert (filepath);
+
+    if (zfile_exists (filepath) ) {
+        if (verbose)
+            zsys_debug ("zfile_test() has to remove %s that should not have been here", filepath);
+        zfile_delete (filepath);
+    }
+    zstr_free (&filepath);
+
+    file = zfile_new (SELFTEST_DIR_RW, eof_checkfile);
+    assert (file);
+
+    //  1. Write something first
+    rc = zfile_output (file);
+    assert (rc == 0);
+    chunk = zchunk_new ("123456789", 9);
+    assert (chunk);
+
+    rc = zfile_write (file, chunk, 0);
+    assert (rc == 0);
+    zchunk_destroy (&chunk);
+    zfile_close (file);
+    assert (zfile_cursize (file) == 9);
+
+    // 2. Read the written something
+    rc = zfile_input (file);
+    assert (rc != -1);
+    // try to read more bytes than there is in the file
+    chunk = zfile_read (file, 1000, 0);
+    assert (zfile_eof(file));
+    assert (zchunk_streq (chunk, "123456789"));
+    zchunk_destroy (&chunk);
+
+    // reading is ok
+    chunk = zfile_read (file, 5, 0);
+    assert (!zfile_eof(file));
+    assert (zchunk_streq (chunk, "12345"));
+    zchunk_destroy (&chunk);
+
+    // read from non zero offset until the end
+    chunk = zfile_read (file, 5, 5);
+    assert (zfile_eof(file));
+    assert (zchunk_streq (chunk, "6789"));
+    zchunk_destroy (&chunk);
+    zfile_remove (file);
+    zfile_close (file);
+    zfile_destroy (&file);
+
+#if defined (__WINDOWS__)
+    zsys_shutdown();
+#endif
+
     //  @end
 
     printf ("OK\n");

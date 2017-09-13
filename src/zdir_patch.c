@@ -20,7 +20,7 @@
 @end
 */
 
-#include "../include/czmq.h"
+#include "czmq_classes.h"
 
 //  Structure of our class
 //  If you modify this beware to also change _dup
@@ -29,7 +29,7 @@ struct _zdir_patch_t {
     char *path;                 //  Directory path
     char *vpath;                //  Virtual file path
     zfile_t *file;              //  File we refer to
-    zdir_patch_op_t op;         //  Operation
+    int op;                     //  Operation
     char *digest;               //  File SHA-1 digest
 };
 
@@ -39,35 +39,25 @@ struct _zdir_patch_t {
 //  Create new patch, create virtual path from alias
 
 zdir_patch_t *
-zdir_patch_new (const char *path, zfile_t *file,
-                zdir_patch_op_t op, const char *alias)
+zdir_patch_new (const char *path, zfile_t *file, int op, const char *alias)
 {
     zdir_patch_t *self = (zdir_patch_t *) zmalloc (sizeof (zdir_patch_t));
-    if (!self)
-        return NULL;
+    assert (self);
     self->path = strdup (path);
-    if (self->path)
-        self->file = zfile_dup (file);
-    if (!self->file) {
-        zdir_patch_destroy (&self);
-        return NULL;
-    }
-
+    assert (self->path);
+    self->file = zfile_dup (file);
+    assert (self->file);
     self->op = op;
 
     //  Calculate virtual path for patch (remove path, prefix alias)
     const char *filename = zfile_filename (file, path);
-    if (!filename) {
-        zdir_patch_destroy (&self);
-        return NULL;
-    }
+    assert (filename);
     assert (*filename != '/');
+
     self->vpath = (char *) zmalloc (strlen (alias) + strlen (filename) + 2);
-    if (!self->vpath) {
-        zdir_patch_destroy (&self);
-        return NULL;
-    }
-    if (alias [strlen (alias) - 1] == '/')
+    assert (self->vpath);
+
+    if (strlen (alias) && alias [strlen (alias) - 1] == '/')
         sprintf (self->vpath, "%s%s", alias, filename);
     else
         sprintf (self->vpath, "%s/%s", alias, filename);
@@ -84,11 +74,11 @@ zdir_patch_destroy (zdir_patch_t **self_p)
     assert (self_p);
     if (*self_p) {
         zdir_patch_t *self = *self_p;
-        free (self->path);
-        free (self->vpath);
-        free (self->digest);
+        freen (self->path);
+        freen (self->vpath);
+        freen (self->digest);
         zfile_destroy (&self->file);
-        free (self);
+        freen (self);
         *self_p = NULL;
     }
 }
@@ -112,7 +102,7 @@ zdir_patch_dup (zdir_patch_t *self)
                 copy->vpath = strdup (self->vpath);
             if (copy->vpath)
                 //  Don't recalculate hash when we duplicate patch
-                copy->digest = self->digest ? strdup (self->digest) : NULL;
+                copy->digest = self->digest? strdup (self->digest): NULL;
 
             if (copy->digest == NULL && copy->op != patch_delete)
                 zdir_patch_destroy (&copy);
@@ -149,7 +139,7 @@ zdir_patch_file (zdir_patch_t *self)
 //  --------------------------------------------------------------------------
 //  Return operation
 
-zdir_patch_op_t
+int
 zdir_patch_op (zdir_patch_t *self)
 {
     assert (self);
@@ -203,17 +193,47 @@ zdir_patch_test (bool verbose)
     printf (" * zdir_patch: ");
 
     //  @selftest
-    zfile_t *file = zfile_new (".", "bilbo");
+
+    // Note: If your selftest reads SCMed fixture data, please keep it in
+    // src/selftest-ro; if your test creates filesystem objects, please
+    // do so under src/selftest-rw. They are defined below along with a
+    // usecase for the variables (assert) to make compilers happy.
+    const char *SELFTEST_DIR_RO = "src/selftest-ro";
+    const char *SELFTEST_DIR_RW = "src/selftest-rw";
+    assert (SELFTEST_DIR_RO);
+    assert (SELFTEST_DIR_RW);
+    // Uncomment these to use C++ strings in C++ selftest code:
+    //std::string str_SELFTEST_DIR_RO = std::string(SELFTEST_DIR_RO);
+    //std::string str_SELFTEST_DIR_RW = std::string(SELFTEST_DIR_RW);
+    //assert ( (str_SELFTEST_DIR_RO != "") );
+    //assert ( (str_SELFTEST_DIR_RW != "") );
+    // NOTE that for "char*" context you need (str_SELFTEST_DIR_RO + "/myfilename").c_str()
+
+    const char *testfile = "bilbo";
+    const char *prefix   = "/";
+    char *prefixed_testfile = zsys_sprintf ("%s%s", prefix, testfile);
+    assert (prefixed_testfile);
+
+    // Make sure old aborted tests do not hinder us
+    zsys_file_delete (prefixed_testfile);
+
+    zfile_t *file = zfile_new (SELFTEST_DIR_RW, testfile);
     assert (file);
-    zdir_patch_t *patch = zdir_patch_new (".", file, patch_create, "/");
+    zdir_patch_t *patch = zdir_patch_new (SELFTEST_DIR_RW, file, patch_create, prefix);
     assert (patch);
     zfile_destroy (&file);
 
     file = zdir_patch_file (patch);
     assert (file);
-    assert (streq (zfile_filename (file, "."), "bilbo"));
-    assert (streq (zdir_patch_vpath (patch), "/bilbo"));
+    assert (streq (zfile_filename (file, SELFTEST_DIR_RW), testfile));
+    assert (streq (zdir_patch_vpath (patch), prefixed_testfile));
     zdir_patch_destroy (&patch);
+
+    zstr_free (&prefixed_testfile);
+
+#if defined (__WINDOWS__)
+    zsys_shutdown();
+#endif
     //  @end
 
     printf ("OK\n");

@@ -35,66 +35,50 @@
 @end
 */
 
-#include "../include/czmq.h"
+#include "czmq_classes.h"
 
-//  Structure of our class
 
-struct _zcertstore_t {
-    char *location;             //  Directory location
+//  --------------------------------------------------------------------------
+//  Disk loader
+
+typedef struct _disk_loader_state {
+    char *location;  //  Directory location
     //  This isn't sufficient; we should check the hash of all files
     //  or else use a trigger like inotify on Linux.
-    time_t modified;            //  Modified time of directory
-    size_t count;               //  Number of certificates
-    size_t cursize;             //  Total size of certificates
-    zhashx_t *certs;            //  Loaded certificates
+    time_t modified; //  Modified time of directory
+    size_t count;    //  Number of certificates
+    size_t cursize;  //  Total size of certificates
+} disk_loader_state;
+
+
+//  --------------------------------------------------------------------------
+//  Zcertstore
+
+struct _zcertstore_t {
+    zcertstore_loader *loader;         //  Certificate loader fn
+    zcertstore_destructor *destructor; //  Certificate loader state destructor
+    void *state;                       //  Certificate loader state data
+    zhashx_t *certs;                   //  Loaded certificates
 };
 
 
 //  --------------------------------------------------------------------------
-//  Constructor
-//
-//  Create a new certificate store from a disk directory, loading and
-//  indexing all certificates in that location. The directory itself may be
-//  absent, and created later, or modified at any time. The certificate store
-//  is automatically refreshed on any zcertstore_lookup() call. If the
-//  location is specified as NULL, creates a pure-memory store, which you
-//  can work with by inserting certificates at runtime.
+//  Disk loader
 
-static void s_load_certs_from_disk (zcertstore_t *self);
-
-zcertstore_t *
-zcertstore_new (const char *location)
-{
-    zcertstore_t *self = (zcertstore_t *) zmalloc (sizeof (zcertstore_t));
-    if (!self)
-        return NULL;
-
-    self->certs = zhashx_new ();
-    if (self->certs) {
-        zhashx_set_destructor (self->certs, (czmq_destructor *) zcert_destroy);
-        if (location) {
-            self->location = strdup (location);
-            if (!self->location) {
-                zcertstore_destroy (&self);
-                return NULL;
-            }
-            s_load_certs_from_disk (self);
-        }
-    }
-    else
-        zcertstore_destroy (&self);
-    return self;
-}
-
-
-//  Load certificates from directory location, if it exists
+static void s_disk_loader (zcertstore_t *self);
 
 static void
-s_load_certs_from_disk (zcertstore_t *self)
+s_disk_loader (zcertstore_t *certstore)
 {
-    zhashx_purge (self->certs);
-    zdir_t *dir = zdir_new (self->location, NULL);
-    if (dir) {
+    disk_loader_state *state = (disk_loader_state *)certstore->state;
+    zdir_t *dir = zdir_new (state->location, NULL);
+    if (dir
+    && (state->modified != zdir_modified (dir)
+    ||  state->count != zdir_count (dir)
+    ||  state->cursize != (size_t) zdir_cursize (dir)))
+    {
+        zhashx_purge (certstore->certs);
+
         //  Load all certificates including those in subdirectories
         zfile_t **filelist = zdir_flatten (dir);
         assert (filelist);
@@ -110,17 +94,68 @@ s_load_certs_from_disk (zcertstore_t *self)
             && !zrex_matches (rex, zfile_filename (file, NULL))) {
                 zcert_t *cert = zcert_load (zfile_filename (file, NULL));
                 if (cert)
-                    zcertstore_insert (self, &cert);
+                    zcertstore_insert (certstore, &cert);
             }
         }
         zdir_flatten_free (&filelist);
-        self->modified = zdir_modified (dir);
-        self->count = zdir_count (dir);
-        self->cursize = zdir_cursize (dir);
+        state->modified = zdir_modified (dir);
+        state->count = zdir_count (dir);
+        state->cursize = zdir_cursize (dir);
 
         zrex_destroy (&rex);
-        zdir_destroy (&dir);
     }
+    zdir_destroy (&dir);
+}
+
+
+//  --------------------------------------------------------------------------
+//  Disk loader destructor
+
+static void
+s_disk_loader_state_destroy (void **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        disk_loader_state *self = (disk_loader_state *)*self_p;
+        freen (self->location);
+        freen (self);
+        *self_p = NULL;
+    }
+}
+
+
+//  --------------------------------------------------------------------------
+//  Constructor
+//
+//  Create a new certificate store, loading and indexing all certificates from
+//  the loader callback. The default loader is the directory loader, which
+//  gathers certificates from a local system folder. Specifying the location
+//  argument will setup the directory loader for this zcertstore instance. The
+//  directory itself may be absent, and created later, or modified at any time.
+//  The certificate store is automatically refreshed on any zcertstore_lookup()
+//  call. If the location is specified as NULL, creates a pure-memory store,
+//  which you can work with by inserting certificates at runtime.
+
+zcertstore_t *
+zcertstore_new (const char *location)
+{
+    zcertstore_t *self = (zcertstore_t *) zmalloc (sizeof (zcertstore_t));
+    assert (self);
+
+    self->certs = zhashx_new ();
+    assert (self->certs);
+    zhashx_set_destructor (self->certs, (czmq_destructor *) zcert_destroy);
+
+    if (location) {
+        disk_loader_state *state = (disk_loader_state *) zmalloc (sizeof (disk_loader_state));
+        state->location = strdup (location);
+        assert (state->location);
+        state->modified = 0;
+        state->count = 0;
+        state->cursize = 0;
+        zcertstore_set_loader (self, s_disk_loader, s_disk_loader_state_destroy, (void *)state);
+    }
+    return self;
 }
 
 
@@ -137,10 +172,28 @@ zcertstore_destroy (zcertstore_t **self_p)
     if (*self_p) {
         zcertstore_t *self = *self_p;
         zhashx_destroy (&self->certs);
-        free (self->location);
-        free (self);
+
+        if (self->destructor)
+            self->destructor (&self->state);
+
+        freen (self);
         *self_p = NULL;
     }
+}
+
+
+//  --------------------------------------------------------------------------
+//  Override the default disk loader with a custom loader fn.
+
+void
+zcertstore_set_loader (zcertstore_t *self, zcertstore_loader loader, zcertstore_destructor destructor, void *state)
+{
+    if (self->destructor && self->state)
+        self->destructor (&self->state);
+    self->loader = loader;
+    self->destructor = destructor;
+    self->state = state;
+    self->loader (self);
 }
 
 
@@ -151,17 +204,9 @@ zcertstore_destroy (zcertstore_t **self_p)
 zcert_t *
 zcertstore_lookup (zcertstore_t *self, const char *public_key)
 {
-    //  If directory has changed, reload all certificates
-    if (self->location) {
-        zdir_t *dir = zdir_new (self->location, NULL);
-        if (dir
-        && (self->modified != zdir_modified (dir)
-         || self->count != zdir_count (dir)
-         || self->cursize != zdir_cursize (dir)))
-            s_load_certs_from_disk (self);
-            
-        zdir_destroy (&dir);
-    }
+    if (self->loader)
+        self->loader (self);
+
     return (zcert_t *) zhashx_lookup (self->certs, public_key);
 }
 
@@ -181,13 +226,37 @@ zcertstore_insert (zcertstore_t *self, zcert_t **cert_p)
 
 
 //  --------------------------------------------------------------------------
+//  Empty certificate hashtable
+//  This wrapper exists to be friendly to bindings, which don't usually have
+//  access to struct internals (e.g. self->certs).
+
+void
+zcertstore_empty (zcertstore_t *self)
+{
+    zhashx_purge (self->certs);
+}
+
+//  --------------------------------------------------------------------------
+//  Return a list of all the certificates in the store
+
+zlistx_t *
+zcertstore_certs (zcertstore_t *self)
+{
+    if (self->loader)
+        self->loader (self);
+    zlistx_t *certs = zhashx_values(self->certs);
+    zlistx_set_destructor (certs, NULL);
+    return certs;
+}
+
+//  --------------------------------------------------------------------------
 //  Print list of certificates in store to stdout
 
 void
 zcertstore_print (zcertstore_t *self)
 {
-    if (self->location)
-        zsys_info ("zcertstore: certificates at location=%s:", self->location);
+    if (self->loader)
+        zsys_info ("zcertstore: certificates in store");
     else
         zsys_info ("zcertstore: certificates in memory");
 
@@ -200,27 +269,44 @@ zcertstore_print (zcertstore_t *self)
 
 
 //  --------------------------------------------------------------------------
-//  DEPRECATED as incompatible with centralized logging
-//  Print list of certificates in store to open stream
+//  Selftest
 
-void
-zcertstore_fprint (zcertstore_t *self, FILE *file)
+// Trivial example state for testing
+typedef struct _test_loader_state {
+    int index;
+} test_loader_state;
+
+static void
+s_test_loader (zcertstore_t *certstore)
 {
-    if (self->location)
-        fprintf (file, "Certificate store at %s:\n", self->location);
-    else
-        fprintf (file, "Certificate store\n");
+    zcertstore_empty (certstore);
 
-    zcert_t *cert = (zcert_t *) zhashx_first (self->certs);
-    while (cert) {
-        zcert_fprint (cert, file);
-        cert = (zcert_t *) zhashx_next (self->certs);
-    }
+    byte public_key [32] = { 31, 133, 154, 36, 47, 67, 155, 5, 63, 1,
+                             155, 230, 78, 191, 156, 199, 94, 125, 157, 168,
+                             109, 69, 19, 241, 44, 29, 154, 216, 59, 219,
+                             155, 185 };
+    byte secret_key [32] = { 31, 133, 154, 36, 47, 67, 155, 5, 63, 1,
+                             155, 230, 78, 191, 156, 199, 94, 125, 157, 168,
+                             109, 69, 19, 241, 44, 29, 154, 216, 59, 219,
+                             155, 185 };
+
+    zcert_t *cert = zcert_new_from (public_key, secret_key);
+    zcertstore_insert (certstore, &cert);
+
+    test_loader_state *state = (test_loader_state *)certstore->state;
+    state->index++;
 }
 
-
-//  --------------------------------------------------------------------------
-//  Selftest
+static void
+s_test_destructor (void **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        test_loader_state *self = (test_loader_state *)*self_p;
+        freen (self);
+        *self_p = NULL;
+    }
+}
 
 void
 zcertstore_test (bool verbose)
@@ -230,12 +316,46 @@ zcertstore_test (bool verbose)
         printf ("\n");
 
     //  @selftest
+
+    // Note: If your selftest reads SCMed fixture data, please keep it in
+    // src/selftest-ro; if your test creates filesystem objects, please
+    // do so under src/selftest-rw. They are defined below along with a
+    // usecase for the variables (assert) to make compilers happy.
+    const char *SELFTEST_DIR_RO = "src/selftest-ro";
+    const char *SELFTEST_DIR_RW = "src/selftest-rw";
+    assert (SELFTEST_DIR_RO);
+    assert (SELFTEST_DIR_RW);
+    // Uncomment these to use C++ strings in C++ selftest code:
+    //std::string str_SELFTEST_DIR_RO = std::string(SELFTEST_DIR_RO);
+    //std::string str_SELFTEST_DIR_RW = std::string(SELFTEST_DIR_RW);
+    //assert ( (str_SELFTEST_DIR_RO != "") );
+    //assert ( (str_SELFTEST_DIR_RW != "") );
+    // NOTE that for "char*" context you need (str_SELFTEST_DIR_RO + "/myfilename").c_str()
+
+    const char *testbasedir  = ".test_zcertstore";
+    const char *testfile = "mycert.txt";
+    char *basedirpath = NULL;   // subdir in a test, under SELFTEST_DIR_RW
+    char *filepath = NULL;      // pathname to testfile in a test, in dirpath
+
+    basedirpath = zsys_sprintf ("%s/%s", SELFTEST_DIR_RW, testbasedir);
+    assert (basedirpath);
+    filepath = zsys_sprintf ("%s/%s", basedirpath, testfile);
+    assert (filepath);
+
+    // Make sure old aborted tests do not hinder us
+    zdir_t *dir = zdir_new (basedirpath, NULL);
+    if (dir) {
+        zdir_remove (dir, true);
+        zdir_destroy (&dir);
+    }
+    zsys_file_delete (filepath);
+    zsys_dir_delete  (basedirpath);
+
     //  Create temporary directory for test files
-#   define TESTDIR ".test_zcertstore"
-    zsys_dir_create (TESTDIR);
+    zsys_dir_create (basedirpath);
 
     //  Load certificate store from disk; it will be empty
-    zcertstore_t *certstore = zcertstore_new (TESTDIR);
+    zcertstore_t *certstore = zcertstore_new (basedirpath);
     assert (certstore);
 
     //  Create a single new certificate and save to disk
@@ -244,24 +364,57 @@ zcertstore_test (bool verbose)
     char *client_key = strdup (zcert_public_txt (cert));
     assert (client_key);
     zcert_set_meta (cert, "name", "John Doe");
-    zcert_save (cert, TESTDIR "/mycert.txt");
+    zcert_save (cert, filepath);
     zcert_destroy (&cert);
 
     //  Check that certificate store refreshes as expected
     cert = zcertstore_lookup (certstore, client_key);
     assert (cert);
     assert (streq (zcert_meta (cert, "name"), "John Doe"));
-    free (client_key);
+
+#ifdef CZMQ_BUILD_DRAFT_API
+    // Iterate through certs
+    zlistx_t *certs = zcertstore_certs(certstore);
+    cert = (zcert_t *) zlistx_first(certs);
+    int cert_count = 0;
+    while (cert) {
+        assert (streq (zcert_meta (cert, "name"), "John Doe"));
+        cert = (zcert_t *) zlistx_next(certs);
+        cert_count++;
+    }
+    assert(cert_count==1);
+    zlistx_destroy(&certs);
+#endif
+
+    //  Test custom loader
+    test_loader_state *state = (test_loader_state *) zmalloc (sizeof (test_loader_state));
+    state->index = 0;
+    zcertstore_set_loader (certstore, s_test_loader, s_test_destructor, (void *)state);
+#if (ZMQ_VERSION_MAJOR >= 4)
+    cert = zcertstore_lookup (certstore, client_key);
+    assert (cert == NULL);
+    cert = zcertstore_lookup (certstore, "abcdefghijklmnopqrstuvwxyzabcdefghijklmn");
+    assert (cert);
+#endif
+
+    freen (client_key);
 
     if (verbose)
         zcertstore_print (certstore);
     zcertstore_destroy (&certstore);
 
     //  Delete all test files
-    zdir_t *dir = zdir_new (TESTDIR, NULL);
+    dir = zdir_new (basedirpath, NULL);
     assert (dir);
     zdir_remove (dir, true);
     zdir_destroy (&dir);
+
+    zstr_free (&basedirpath);
+    zstr_free (&filepath);
+
+#if defined (__WINDOWS__)
+    zsys_shutdown();
+#endif
     //  @end
     printf ("OK\n");
 }

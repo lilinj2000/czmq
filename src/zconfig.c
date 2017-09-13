@@ -53,7 +53,7 @@
 @end
 */
 
-#include "../include/czmq.h"
+#include "czmq_classes.h"
 
 //  Structure of our class
 
@@ -93,8 +93,7 @@ zconfig_t *
 zconfig_new (const char *name, zconfig_t *parent)
 {
     zconfig_t *self = (zconfig_t *) zmalloc (sizeof (zconfig_t));
-    if (!self)
-        return NULL;
+    assert (self);
 
     zconfig_set_name (self, name);
     if (parent) {
@@ -131,9 +130,9 @@ zconfig_destroy (zconfig_t **self_p)
         //  Destroy other properties and then self
         zlist_destroy (&self->comments);
         zfile_destroy (&self->file);
-        free (self->name);
-        free (self->value);
-        free (self);
+        freen (self->name);
+        freen (self->value);
+        freen (self);
         *self_p = NULL;
     }
 }
@@ -226,7 +225,7 @@ void
 zconfig_set_name (zconfig_t *self, const char *name)
 {
     assert (self);
-    free (self->name);
+    freen (self->name);
     self->name = name? strdup (name): NULL;
 }
 
@@ -241,7 +240,7 @@ void
 zconfig_set_value (zconfig_t *self, const char *format, ...)
 {
     assert (self);
-    free (self->value);
+    zstr_free (&self->value);
     if (format) {
         va_list argptr;
         va_start (argptr, format);
@@ -359,13 +358,15 @@ zconfig_execute (zconfig_t *self, zconfig_fct handler, void *arg)
 }
 
 
-//  Return number of bytes processed, or zero
+//  Return number of bytes processed if successful, otherwise -1.
 
 static int
 s_config_execute (zconfig_t *self, zconfig_fct handler, void *arg, int level)
 {
     assert (self);
     int size = handler (self, arg, level);
+    if (size == -1)
+        return -1; // fail early
 
     //  Process all children in one go, as a list
     zconfig_t *child = self->child;
@@ -463,7 +464,7 @@ s_config_printf (zconfig_t *self, void *arg, char *format, ...)
             fprintf ((FILE *) arg, "%s", string);
     }
     size_t size = strlen (string);
-    free (string);
+    zstr_free (&string);
     if (size > INT_MAX)
         return -1;
 
@@ -513,7 +514,7 @@ zconfig_loadf (const char *format, ...)
     va_end (argptr);
     if (filename) {
         zconfig_t *config = zconfig_load (filename);
-        free (filename);
+        freen (filename);
         return config;
     }
     else
@@ -535,7 +536,7 @@ zconfig_savef (zconfig_t *self, const char *format, ...)
     va_end (argptr);
     if (filename) {
         int rc = zconfig_save (self, filename);
-        free (filename);
+        zstr_free (&filename);
         return rc;
     }
     else
@@ -657,7 +658,7 @@ zconfig_chunk_load (zchunk_t *chunk)
                 }
                 else {
                     zclock_log ("E (zconfig): (%d) indentation error", lineno);
-                    free (value);
+                    freen (value);
                     valid = false;
                 }
             }
@@ -666,7 +667,7 @@ zconfig_chunk_load (zchunk_t *chunk)
         if (s_verify_eoln (scanner, lineno))
             valid = false;
 
-        free (name);
+        freen (name);
         if (!valid)
             break;
     }
@@ -732,7 +733,7 @@ s_collect_name (char **start, int lineno)
     && (name [0] == '/'
     ||  name [length - 1] == '/')) {
         zclock_log ("E (zconfig): (%d) '/' not valid at name start or end", lineno);
-        free (name);
+        freen (name);
         name = NULL;
     }
     return name;
@@ -810,7 +811,7 @@ s_collect_value (char **start, int lineno)
     }
     //  If we had an error, drop value and return NULL
     if (rc) {
-        free (value);
+        freen (value);
         value = NULL;
     }
     return value;
@@ -898,7 +899,7 @@ zconfig_set_comment (zconfig_t *self, const char *format, ...)
         va_end (argptr);
 
         zlist_append (self->comments, string);
-        free (string);
+        zstr_free (&string);
     }
     else
         zlist_destroy (&self->comments);
@@ -945,9 +946,43 @@ zconfig_test (bool verbose)
     printf (" * zconfig: ");
 
     //  @selftest
+
+    // Note: If your selftest reads SCMed fixture data, please keep it in
+    // src/selftest-ro; if your test creates filesystem objects, please
+    // do so under src/selftest-rw. They are defined below along with a
+    // usecase for the variables (assert) to make compilers happy.
+    const char *SELFTEST_DIR_RO = "src/selftest-ro";
+    const char *SELFTEST_DIR_RW = "src/selftest-rw";
+    assert (SELFTEST_DIR_RO);
+    assert (SELFTEST_DIR_RW);
+    // Uncomment these to use C++ strings in C++ selftest code:
+    //std::string str_SELFTEST_DIR_RO = std::string(SELFTEST_DIR_RO);
+    //std::string str_SELFTEST_DIR_RW = std::string(SELFTEST_DIR_RW);
+    //assert ( (str_SELFTEST_DIR_RO != "") );
+    //assert ( (str_SELFTEST_DIR_RW != "") );
+    // NOTE that for "char*" context you need (str_SELFTEST_DIR_RO + "/myfilename").c_str()
+
+    const char *testbasedir  = ".test_zconfig";
+    const char *testfile = "test.cfg";
+    char *basedirpath = NULL;   // subdir in a test, under SELFTEST_DIR_RW
+    char *filepath = NULL;      // pathname to testfile in a test, in dirpath
+
+    basedirpath = zsys_sprintf ("%s/%s", SELFTEST_DIR_RW, testbasedir);
+    assert (basedirpath);
+    filepath = zsys_sprintf ("%s/%s", basedirpath, testfile);
+    assert (filepath);
+
+    // Make sure old aborted tests do not hinder us
+    zdir_t *dir = zdir_new (basedirpath, NULL);
+    if (dir) {
+        zdir_remove (dir, true);
+        zdir_destroy (&dir);
+    }
+    zsys_file_delete (filepath);
+    zsys_dir_delete  (basedirpath);
+
     //  Create temporary directory for test files
-#   define TESTDIR ".test_zconfig"
-    zsys_dir_create (TESTDIR);
+    zsys_dir_create (basedirpath);
 
     zconfig_t *root = zconfig_new ("root", NULL);
     assert (root);
@@ -965,12 +1000,12 @@ zconfig_test (bool verbose)
     zconfig_set_comment (root, "   CURVE certificate");
     zconfig_set_comment (root, "   -----------------");
     assert (zconfig_comments (root));
-    zconfig_save (root, TESTDIR "/test.cfg");
+    zconfig_save (root, filepath);
     zconfig_destroy (&root);
-    root = zconfig_load (TESTDIR "/test.cfg");
+    root = zconfig_load (filepath);
     if (verbose)
         zconfig_save (root, "-");
-    assert (streq (zconfig_filename (root), TESTDIR "/test.cfg"));
+    assert (streq (zconfig_filename (root), filepath));
 
     char *email = zconfig_get (root, "/headers/email", NULL);
     assert (email);
@@ -979,7 +1014,7 @@ zconfig_test (bool verbose)
     assert (passwd);
     assert (streq (passwd, "Top Secret"));
 
-    zconfig_savef (root, "%s/%s", TESTDIR, "test.cfg");
+    zconfig_savef (root, "%s/%s", basedirpath, testfile);
     assert (!zconfig_has_changed (root));
     int rc = zconfig_reload (&root);
     assert (rc == 0);
@@ -1001,7 +1036,7 @@ zconfig_test (bool verbose)
     char *string = zconfig_str_save (root);
     assert (string);
     assert (streq (string, (char *) zchunk_data (chunk)));
-    free (string);
+    freen (string);
     assert (chunk);
     zconfig_destroy (&root);
 
@@ -1013,17 +1048,57 @@ zconfig_test (bool verbose)
 
     //  Test config can't be saved to a file in a path that doesn't
     //  exist or isn't writable
-    rc = zconfig_savef (root, "%s/path/that/doesnt/exist/%s", TESTDIR, "test.cfg");
+    rc = zconfig_savef (root, "%s/path/that/doesnt/exist/%s", basedirpath, testfile);
     assert (rc == -1);
 
     zconfig_destroy (&root);
     zchunk_destroy (&chunk);
 
+    // Test str_load
+    zconfig_t *config = zconfig_str_load (
+        "malamute\n"
+        "    endpoint = ipc://@/malamute\n"
+        "    producer = STREAM\n"
+        "    consumer\n"
+        "        STREAM2 = .*\n"
+        "        STREAM3 = HAM\n"
+        "server\n"
+        "    verbose = true\n"
+        );
+    assert (config);
+    assert (streq (zconfig_get (config, "malamute/endpoint", NULL), "ipc://@/malamute"));
+    assert (streq (zconfig_get (config, "malamute/producer", NULL), "STREAM"));
+    assert (zconfig_locate (config, "malamute/consumer"));
+
+    zconfig_t *c = zconfig_child (zconfig_locate (config, "malamute/consumer"));
+    assert (c);
+    assert (streq (zconfig_name (c), "STREAM2"));
+    assert (streq (zconfig_value (c), ".*"));
+
+    c = zconfig_next (c);
+    assert (c);
+    assert (streq (zconfig_name (c), "STREAM3"));
+    assert (streq (zconfig_value (c), "HAM"));
+
+    c = zconfig_next (c);
+    assert (!c);
+
+    assert (streq (zconfig_get (config, "server/verbose", NULL), "true"));
+
+    zconfig_destroy (&config);
+
     //  Delete all test files
-    zdir_t *dir = zdir_new (TESTDIR, NULL);
+    dir = zdir_new (basedirpath, NULL);
     assert (dir);
     zdir_remove (dir, true);
     zdir_destroy (&dir);
+
+    zstr_free (&basedirpath);
+    zstr_free (&filepath);
+
+#if defined (__WINDOWS__)
+    zsys_shutdown();
+#endif
     //  @end
 
     printf ("OK\n");
